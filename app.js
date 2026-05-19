@@ -300,8 +300,9 @@ function renderDishes() {
 
   grid.innerHTML = filtered.map(dish => {
     const typeLabel = dish.type === 'ambos' ? 'Comida · Cena' : (dish.type.charAt(0).toUpperCase() + dish.type.slice(1));
-    const ingredients = dish.ingredients.slice(0, 4);
-    const more = dish.ingredients.length - 4;
+    const allIngredients = Array.isArray(dish.ingredients) ? dish.ingredients : [];
+    const ingredients = allIngredients.slice(0, 4);
+    const more = allIngredients.length - 4;
     const tags = Array.isArray(dish.tags) ? dish.tags : [];
     return `
       <article class="dish-card" data-id="${dish.id}">
@@ -408,7 +409,7 @@ function openEditDish(id) {
   const dish = state.dishes.find(d => d.id === id);
   if (!dish) return;
   state.editingDish = id;
-  state.modalIngredients = dish.ingredients.map(i => ({
+  state.modalIngredients = (dish.ingredients || []).map(i => ({
     id: i.id || uid(),
     name: i.name,
     qty: i.qty
@@ -1217,6 +1218,36 @@ async function exportData() {
   }
 }
 
+// Normaliza un plato del JSON importado al schema actual. Rellena defaults para
+// que exports de versiones antiguas (o JSONs manipulados con campos faltantes)
+// no dejen registros inconsistentes en disco.
+function normalizeImportedDish(d) {
+  const validTypes = ['comida', 'cena', 'ambos'];
+  const validRoles = ['main', 'starter', 'complete'];
+  const validSeasons = ['any', 'invierno', 'verano'];
+  const sanitizeItem = (it) => ({
+    id: it.id || uid(),
+    name: String(it.name),
+    qty: it.qty != null ? String(it.qty) : ''
+  });
+  return {
+    id: d.id,
+    name: String(d.name),
+    description: typeof d.description === 'string' ? d.description : '',
+    type: validTypes.includes(d.type) ? d.type : 'comida',
+    role: validRoles.includes(d.role) ? d.role : 'main',
+    season: validSeasons.includes(d.season) ? d.season : 'any',
+    tags: Array.isArray(d.tags) ? d.tags.filter(t => typeof t === 'string') : [],
+    ingredients: Array.isArray(d.ingredients)
+      ? d.ingredients.filter(i => i && typeof i.name === 'string' && i.name.trim()).map(sanitizeItem)
+      : [],
+    spices: Array.isArray(d.spices)
+      ? d.spices.filter(s => s && typeof s.name === 'string' && s.name.trim()).map(sanitizeItem)
+      : [],
+    createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now()
+  };
+}
+
 async function importData(file) {
   let payload;
   try {
@@ -1232,9 +1263,27 @@ async function importData(file) {
     return;
   }
 
-  if (!confirm('Esto reemplazará TODOS tus datos actuales (platos, semana, lista, tema). ¿Continuar?')) {
+  // Validar y normalizar cada plato: descarta los que no tengan id+name válidos.
+  const validDishes = [];
+  let rejected = 0;
+  for (const raw of payload.dishes) {
+    if (!raw || typeof raw.id !== 'string' || !raw.id ||
+        typeof raw.name !== 'string' || !raw.name.trim()) {
+      rejected++;
+      continue;
+    }
+    validDishes.push(normalizeImportedDish(raw));
+  }
+
+  if (validDishes.length === 0 && payload.dishes.length > 0) {
+    showToast('Archivo sin platos válidos');
     return;
   }
+
+  const msg = rejected > 0
+    ? `Esto reemplazará TODOS tus datos actuales. Se descartarán ${rejected} platos malformados. ¿Continuar?`
+    : 'Esto reemplazará TODOS tus datos actuales (platos, semana, lista, tema). ¿Continuar?';
+  if (!confirm(msg)) return;
 
   try {
     // Una sola transacción sobre los 4 stores: o todo o nada.
@@ -1253,7 +1302,7 @@ async function importData(file) {
       shoppingStore.clear();
       settingsStore.clear();
 
-      payload.dishes.forEach(d => dishStore.put(d));
+      validDishes.forEach(d => dishStore.put(d));
       if (payload.week) {
         weekStore.put({
           id: 'current',
@@ -1272,11 +1321,13 @@ async function importData(file) {
     await initTheme();
     await loadCustomTags();
     await loadSeasonMode();
+    await loadShowSources();
     applySeasonChip();
+    applyShowSourcesCheckbox();
     await loadDishes();
     await loadWeek();
     await loadShopping();
-    showToast('Datos importados');
+    showToast(rejected > 0 ? `Datos importados (${rejected} descartados)` : 'Datos importados');
   } catch (err) {
     console.error('Import failed:', err);
     showToast('Error al importar');

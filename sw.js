@@ -1,5 +1,5 @@
 /* MiMenu · Service Worker */
-const CACHE_NAME = 'mimenu-v3';
+const CACHE_NAME = 'mimenu-v4';
 const ASSETS = [
   './',
   './index.html',
