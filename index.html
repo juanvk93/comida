@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f0e0c" />
+  <title>MiMenu · Menú Semanal</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body data-theme="dark">
+
+  <!-- Header -->
+  <header class="app-header">
+    <div class="brand">
+      <svg class="logo" viewBox="0 0 40 40" aria-hidden="true">
+        <circle cx="20" cy="20" r="18" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        <path d="M12 20 Q20 8 28 20 Q20 32 12 20 Z" fill="currentColor" opacity="0.85"/>
+        <circle cx="20" cy="20" r="2.5" fill="var(--bg)"/>
+      </svg>
+      <div class="brand-text">
+        <h1>MiMenu</h1>
+      </div>
+    </div>
+    <button class="theme-toggle" id="themeToggle" aria-label="Cambiar tema">
+      <svg class="icon-sun" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <circle cx="12" cy="12" r="4"/>
+        <path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/>
+      </svg>
+      <svg class="icon-moon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+        <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+      </svg>
+    </button>
+  </header>
+
+  <!-- Tab navigation -->
+  <nav class="tabs">
+    <button class="tab active" data-tab="dishes">
+      <span class="tab-label">Platos</span>
+    </button>
+    <button class="tab" data-tab="week">
+      <span class="tab-label">Semana</span>
+    </button>
+    <button class="tab" data-tab="shopping">
+      <span class="tab-label">Compra</span>
+    </button>
+  </nav>
+
+  <main>
+
+    <!-- ============ TAB: PLATOS ============ -->
+    <section class="view active" id="view-dishes">
+      <div class="view-header">
+        <h2 class="display">Tus platos</h2>
+        <button class="btn-primary" id="openCreateDish">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+          <span>Nuevo plato</span>
+        </button>
+      </div>
+
+      <div class="filters">
+        <button class="chip active" data-filter="all">Todos <span class="chip-count" id="countAll">0</span></button>
+        <button class="chip" data-filter="comida">Comida <span class="chip-count" id="countLunch">0</span></button>
+        <button class="chip" data-filter="cena">Cena <span class="chip-count" id="countDinner">0</span></button>
+      </div>
+
+      <div class="filters tag-filters" id="tagFilters" role="group" aria-label="Filtrar por etiqueta"></div>
+
+      <div class="dishes-grid" id="dishesGrid"></div>
+
+      <div class="empty-state" id="emptyDishes">
+        <svg viewBox="0 0 80 80" aria-hidden="true">
+          <circle cx="40" cy="40" r="32" fill="none" stroke="currentColor" stroke-width="1" opacity="0.3"/>
+          <path d="M28 40 Q40 28 52 40 Q40 52 28 40" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        <h3>Tu recetario está vacío</h3>
+        <p>Empieza por crear tu primer plato. Añade ingredientes y decide si es para comer o cenar.</p>
+      </div>
+    </section>
+
+    <!-- ============ TAB: SEMANA ============ -->
+    <section class="view" id="view-week">
+      <div class="view-header">
+        <h2 class="display">Tu semana</h2>
+        <button class="btn-primary" id="generateWeek">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg>
+          <span>Generar</span>
+        </button>
+      </div>
+
+      <div class="filters season-filter" role="group" aria-label="Modo de estación para la generación">
+        <button class="chip active" data-season="any">Cualquiera</button>
+        <button class="chip" data-season="invierno">Invierno</button>
+        <button class="chip" data-season="verano">Verano</button>
+      </div>
+
+      <div class="week-empty" id="weekEmpty">
+        <h3>Genera una semana al azar</h3>
+        <p class="muted">Necesitas al menos un plato de comida y uno de cena en tu recetario para empezar.</p>
+      </div>
+
+      <div class="week-grid" id="weekGrid"></div>
+    </section>
+
+    <!-- ============ TAB: COMPRA ============ -->
+    <section class="view" id="view-shopping">
+      <div class="view-header">
+        <h2 class="display">Compra</h2>
+        <button class="btn-primary" id="clearChecks">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5"/></svg>
+          <span>Desmarcar todo</span>
+        </button>
+      </div>
+
+      <div class="filters shopping-controls" role="group" aria-label="Opciones de visualización">
+        <button type="button" class="chip" id="toggleSources" aria-pressed="false">Mostrar origen ingrediente</button>
+      </div>
+
+      <div class="shopping-meta" id="shoppingMeta"></div>
+      <div class="shopping-list" id="shoppingList"></div>
+
+      <div class="spices-section" id="spicesSection">
+        <h3 class="spices-heading">Especias <span class="spices-tag">sugerencias</span></h3>
+        <div class="shopping-list visible" id="spicesList"></div>
+      </div>
+
+      <div class="empty-state" id="emptyShopping">
+        <svg viewBox="0 0 80 80" aria-hidden="true">
+          <path d="M20 25h40l-4 35H24z" fill="none" stroke="currentColor" stroke-width="1.5"/>
+          <path d="M30 25c0-7 4-12 10-12s10 5 10 12" fill="none" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+        <h3>Sin lista de compra</h3>
+        <p>Genera una semana en la pestaña Semana y aquí aparecerá todo lo que necesitas.</p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="data-footer">
+    <button type="button" class="data-link" id="exportData">Exportar datos</button>
+    <span class="data-sep" aria-hidden="true">·</span>
+    <button type="button" class="data-link" id="importData">Importar datos</button>
+    <input type="file" id="importFile" accept="application/json,.json" hidden />
+  </footer>
+
+  <!-- ============ MODAL: Crear/editar plato ============ -->
+  <div class="modal-backdrop" id="modalBackdrop">
+    <div class="modal" role="dialog" aria-modal="true">
+      <div class="modal-header">
+        <h2 class="modal-title" id="modalTitle">Nuevo plato</h2>
+        <p class="modal-subtitle" id="modalEyebrow"></p>
+        <button class="modal-close" id="modalClose" aria-label="Cerrar">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+        </button>
+      </div>
+
+      <form id="dishForm" class="modal-form">
+        <input type="hidden" id="dishId" />
+
+        <label class="field">
+          <span class="field-label">Nombre <em>*</em></span>
+          <input type="text" id="dishName" required maxlength="60" placeholder="Ej. Pasta al pesto" autocomplete="off" />
+        </label>
+
+        <label class="field">
+          <span class="field-label">Descripción</span>
+          <textarea id="dishDescription" rows="2" maxlength="200" placeholder="Una nota breve, opcional"></textarea>
+        </label>
+
+        <fieldset class="field-group">
+          <legend class="field-label">Tipo <em>*</em></legend>
+          <div class="radio-group">
+            <label class="radio">
+              <input type="radio" name="dishType" value="comida" checked />
+              <span>Comida</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishType" value="cena" />
+              <span>Cena</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishType" value="ambos" />
+              <span>Ambos</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field-group">
+          <legend class="field-label">Rol <em>*</em></legend>
+          <div class="radio-group">
+            <label class="radio">
+              <input type="radio" name="dishRole" value="main" checked />
+              <span>Principal</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishRole" value="starter" />
+              <span>Entrante</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishRole" value="complete" />
+              <span>Completo</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <fieldset class="field-group">
+          <legend class="field-label">Estación</legend>
+          <div class="radio-group">
+            <label class="radio">
+              <input type="radio" name="dishSeason" value="any" checked />
+              <span>Cualquiera</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishSeason" value="invierno" />
+              <span>Invierno</span>
+            </label>
+            <label class="radio">
+              <input type="radio" name="dishSeason" value="verano" />
+              <span>Verano</span>
+            </label>
+          </div>
+        </fieldset>
+
+        <div class="field">
+          <span class="field-label">Ingredientes <em>*</em></span>
+          <div class="ingredient-input">
+            <input type="text" id="ingredientName" placeholder="Ingrediente" autocomplete="off" list="ingredientSuggestions" />
+            <input type="text" id="ingredientQty" placeholder="Cantidad (ej. 200g)" autocomplete="off" />
+            <button type="button" class="btn-add" id="addIngredient" aria-label="Añadir ingrediente">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+          <datalist id="ingredientSuggestions"></datalist>
+          <ul class="ingredient-list" id="ingredientList"></ul>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Especias</span>
+          <div class="ingredient-input">
+            <input type="text" id="spiceName" placeholder="Especia (ej. comino)" autocomplete="off" />
+            <input type="text" id="spiceQty" placeholder="Cantidad (opcional)" autocomplete="off" />
+            <button type="button" class="btn-add" id="addSpice" aria-label="Añadir especia">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+          <ul class="ingredient-list" id="spiceList"></ul>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Etiquetas</span>
+          <div class="tag-picker" id="tagPicker" role="group" aria-label="Etiquetas del plato"></div>
+          <div class="ingredient-input new-tag-input">
+            <input type="text" id="newTagInput" placeholder="Crear nueva etiqueta" autocomplete="off" maxlength="20" />
+            <button type="button" class="btn-add" id="addNewTag" aria-label="Crear etiqueta">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
+            </button>
+          </div>
+        </div>
+
+        <div class="modal-actions">
+          <button type="button" class="btn-ghost" id="deleteDish" hidden>Eliminar</button>
+          <button type="button" class="btn-secondary" id="cancelDish">Cancelar</button>
+          <button type="submit" class="btn-primary">Guardar</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- ============ Toast ============ -->
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

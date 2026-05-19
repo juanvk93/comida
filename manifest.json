@@ -1,0 +1,33 @@
+{
+  "name": "MiMenu · Menú Semanal",
+  "short_name": "MiMenu",
+  "description": "Organiza tus comidas y cenas semanales y genera tu lista de la compra automáticamente.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f0e0c",
+  "theme_color": "#0f0e0c",
+  "lang": "es",
+  "categories": ["food", "lifestyle", "productivity"],
+  "icons": [
+    {
+      "src": "icons/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}
