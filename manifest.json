@@ -6,8 +6,8 @@
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0f0e0c",
-  "theme_color": "#0f0e0c",
+  "background_color": "#131313",
+  "theme_color": "#131313",
   "lang": "es",
   "categories": ["food", "lifestyle", "productivity"],
   "icons": [
