@@ -201,7 +201,7 @@ const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', '
 
 const BUILTIN_TAGS = ['pasta', 'arroz', 'legumbre', 'pescado', 'carne', 'ave', 'huevo', 'verdura', 'sopa', 'ensalada'];
 
-const APP_VERSION = '1.6.0';
+const APP_VERSION = '1.7.0';
 
 // Paleta curada de acentos. `indigo` (por defecto) no define vars: deja que el
 // CSS aplique los valores afinados por tema (dark/light) de :root. El resto
@@ -228,6 +228,14 @@ const ACCENTS = {
 
 // Historial de cambios. El primero es el más reciente y se marca como "actual".
 const CHANGELOG = [
+  { version: '1.7.0', date: 'Junio 2026', items: [
+    'Archivar platos: ocúltalos del recetario y de la generación sin borrarlos (chip «Archivados»).',
+    'Sugerir la semana entera con IA a partir de tu recetario, buscando variedad.',
+    '«¿Qué cocino con lo que tengo?»: la IA propone un plato desde tu despensa.',
+    'Sugerir etiquetas y alérgenos con IA al crear un plato.',
+    'Elige proveedor de IA: Gemini, Claude o ChatGPT (cada uno con su clave).',
+    'Diálogos de confirmación con el estilo de la app en vez de los del navegador.'
+  ]},
   { version: '1.6.0', date: 'Junio 2026', items: [
     'Crear platos con IA (Gemini): descríbelo o haz una foto y se rellena el formulario solo.',
     'Reordenar la semana arrastrando días completos, no solo platos sueltos.',
@@ -414,6 +422,44 @@ function showToast(message) {
   toast._timer = setTimeout(() => toast.classList.remove('visible'), 2500);
 }
 
+// Modal de confirmación propio (sustituye a confirm() nativo). Devuelve
+// Promise<bool>. opts: {title, confirmText, danger}. Escape se captura antes que
+// el handler global para no cerrar también lo que haya debajo.
+function confirmDialog(message, opts = {}) {
+  return new Promise((resolve) => {
+    const backdrop = document.getElementById('confirmBackdrop');
+    if (!backdrop) { resolve(window.confirm(message)); return; }
+    document.getElementById('confirmTitle').textContent = opts.title || 'Confirmar';
+    document.getElementById('confirmMessage').textContent = message;
+    const okBtn = document.getElementById('confirmOk');
+    const cancelBtn = document.getElementById('confirmCancel');
+    okBtn.textContent = opts.confirmText || 'Confirmar';
+    okBtn.classList.toggle('btn-danger', !!opts.danger);
+    okBtn.classList.toggle('btn-primary', !opts.danger);
+    backdrop.classList.add('visible');
+    const cleanup = (val) => {
+      backdrop.classList.remove('visible');
+      okBtn.removeEventListener('click', onOk);
+      cancelBtn.removeEventListener('click', onCancel);
+      backdrop.removeEventListener('click', onBackdrop);
+      document.removeEventListener('keydown', onKey, true);
+      resolve(val);
+    };
+    const onOk = () => cleanup(true);
+    const onCancel = () => cleanup(false);
+    const onBackdrop = (e) => { if (e.target === backdrop) cleanup(false); };
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.stopPropagation(); cleanup(false); }
+      else if (e.key === 'Enter') { e.preventDefault(); cleanup(true); }
+    };
+    okBtn.addEventListener('click', onOk);
+    cancelBtn.addEventListener('click', onCancel);
+    backdrop.addEventListener('click', onBackdrop);
+    document.addEventListener('keydown', onKey, true);
+    setTimeout(() => okBtn.focus(), 50);
+  });
+}
+
 // ============ THEME ============
 async function initTheme() {
   const setting = await idb.get(STORE_SETTINGS, 'theme');
@@ -589,7 +635,7 @@ function openDrawer() {
   drawer.setAttribute('aria-hidden', 'false');
   document.getElementById('menuToggle').setAttribute('aria-expanded', 'true');
   updateStorageStatus();
-  updateGeminiStatus();
+  renderAiSettings();
 }
 
 function closeDrawer() {
@@ -642,45 +688,78 @@ function initToggles() {
   });
 }
 
-// ============ CLAVE DE GEMINI (IA, BYOK) ============
-// La clave del usuario se guarda solo en este dispositivo (settings). Nunca se
-// muestra de vuelta en el input (se deja vacío); el estado se refleja en el
-// texto de `geminiStatus`. Guardar con el campo vacío NO borra la clave: para
-// eso está el botón «Borrar».
-async function loadGeminiKey() {
-  const s = await idb.get(STORE_SETTINGS, 'geminiApiKey');
-  state.geminiApiKey = typeof s?.value === 'string' ? s.value : '';
+// ============ IA: PROVEEDOR Y CLAVES (BYOK) ============
+// Soporta Gemini, Claude (Anthropic) y OpenAI. El usuario elige proveedor y pega
+// su clave; cada clave se guarda solo en este dispositivo (un setting por
+// proveedor). TODA función de IA se dispara con un botón EXPLÍCITO (importar,
+// despensa, semana, etiquetas), nunca en automático: no hay llamadas continuas.
+const AI_PROVIDERS = {
+  gemini: { name: 'Gemini', keySetting: 'geminiApiKey', model: 'gemini-2.0-flash', help: 'Gratis en aistudio.google.com/apikey' },
+  claude: { name: 'Claude', keySetting: 'claudeApiKey', model: 'claude-haiku-4-5', help: 'console.anthropic.com (modelo Haiku, muy barato)' },
+  openai: { name: 'ChatGPT', keySetting: 'openaiApiKey', model: 'gpt-4o-mini', help: 'platform.openai.com/api-keys (modelo mini, barato)' }
+};
+
+async function loadAiSettings() {
+  const p = await idb.get(STORE_SETTINGS, 'aiProvider');
+  state.aiProvider = AI_PROVIDERS[p?.value] ? p.value : 'gemini';
+  for (const def of Object.values(AI_PROVIDERS)) {
+    const s = await idb.get(STORE_SETTINGS, def.keySetting);
+    state[def.keySetting] = typeof s?.value === 'string' ? s.value : '';
+  }
 }
 
-async function saveGeminiKeyFromInput() {
-  const input = document.getElementById('geminiKey');
+function activeProvider() { return AI_PROVIDERS[state.aiProvider] || AI_PROVIDERS.gemini; }
+function activeAiKey() { return state[activeProvider().keySetting] || ''; }
+function aiConfigured() { return !!activeAiKey(); }
+
+async function setAiProvider(p) {
+  if (!AI_PROVIDERS[p]) return;
+  state.aiProvider = p;
+  await idb.put(STORE_SETTINGS, { key: 'aiProvider', value: p });
+  renderAiSettings();
+}
+
+// Refresca el segmentado de proveedor, el placeholder de la clave y el estado.
+function renderAiSettings() {
+  document.querySelectorAll('.seg-option[data-ai-provider]').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.aiProvider === state.aiProvider);
+  });
+  const input = document.getElementById('aiKey');
+  if (input) { input.value = ''; input.placeholder = `Clave de ${activeProvider().name}`; }
+  updateAiStatus();
+}
+
+async function saveAiKeyFromInput() {
+  const input = document.getElementById('aiKey');
   if (!input) return;
   const v = input.value.trim();
-  if (!v) { showToast('Pega tu clave de Gemini (o usa «Borrar»)'); return; }
-  state.geminiApiKey = v;
-  await idb.put(STORE_SETTINGS, { key: 'geminiApiKey', value: v });
+  if (!v) { showToast(`Pega tu clave de ${activeProvider().name} (o usa «Borrar»)`); return; }
+  const setting = activeProvider().keySetting;
+  state[setting] = v;
+  await idb.put(STORE_SETTINGS, { key: setting, value: v });
   input.value = '';
-  updateGeminiStatus();
-  showToast('Clave de Gemini guardada');
+  updateAiStatus();
+  showToast(`Clave de ${activeProvider().name} guardada`);
 }
 
-async function clearGeminiKey() {
-  state.geminiApiKey = '';
-  const input = document.getElementById('geminiKey');
+async function clearActiveAiKey() {
+  const setting = activeProvider().keySetting;
+  state[setting] = '';
+  await idb.put(STORE_SETTINGS, { key: setting, value: '' });
+  const input = document.getElementById('aiKey');
   if (input) input.value = '';
-  await idb.put(STORE_SETTINGS, { key: 'geminiApiKey', value: '' });
-  updateGeminiStatus();
-  showToast('Clave de Gemini eliminada');
+  updateAiStatus();
+  showToast(`Clave de ${activeProvider().name} eliminada`);
 }
 
-function updateGeminiStatus() {
-  const el = document.getElementById('geminiStatus');
+function updateAiStatus() {
+  const el = document.getElementById('aiStatus');
   if (!el) return;
-  const has = !!state.geminiApiKey;
-  el.textContent = has
-    ? 'Clave configurada ✓ — ya puedes usar «Crear con IA» al importar.'
-    : 'Sin clave: «Crear con IA» te pedirá configurarla.';
-  el.classList.toggle('ok', has);
+  const prov = activeProvider();
+  el.textContent = aiConfigured()
+    ? `${prov.name} listo ✓ — usa los botones «IA» (importar, despensa, semana, etiquetas).`
+    : `${prov.name}: pega tu clave para activar la IA. ${prov.help}`;
+  el.classList.toggle('ok', aiConfigured());
 }
 
 // ============ CHANGELOG ============
@@ -1324,7 +1403,7 @@ async function saveDish(e) {
 
 async function deleteDish() {
   if (!state.editingDish) return;
-  if (!confirm('¿Eliminar este plato?')) return;
+  if (!(await confirmDialog('¿Eliminar este plato? No se puede deshacer.', { title: 'Eliminar plato', confirmText: 'Eliminar', danger: true }))) return;
   await idb.delete(STORE_DISHES, state.editingDish);
   await loadDishes();
   hideModal();
@@ -1335,7 +1414,7 @@ async function deleteDish() {
 // platos, también se vacían para no dejar referencias a ids inexistentes.
 async function deleteAllDishes() {
   if (state.dishes.length === 0) { showToast('No hay platos que borrar'); return; }
-  if (!confirm(`¿Borrar TODOS los platos (${state.dishes.length})? También se vaciará la semana y la lista de la compra. No se puede deshacer.`)) return;
+  if (!(await confirmDialog(`Vas a borrar TODOS los platos (${state.dishes.length}). También se vaciará la semana y la lista de la compra. No se puede deshacer.`, { title: 'Borrar todos los platos', confirmText: 'Borrar todo', danger: true }))) return;
   await idb.clear(STORE_DISHES);
   await idb.clear(STORE_WEEK);
   state.week = null;
@@ -2280,7 +2359,7 @@ async function toggleShopping(id) {
 async function clearChecks() {
   const all = [...state.shopping, ...state.spicesShopping];
   if (all.length === 0) return;
-  if (!confirm('¿Desmarcar todos los ingredientes?')) return;
+  if (!(await confirmDialog('¿Desmarcar todos los ingredientes de la lista?', { title: 'Desmarcar', confirmText: 'Desmarcar' }))) return;
 
   const toUpdate = all.filter(item => item.checked);
   toUpdate.forEach(item => { item.checked = false; });
@@ -2461,7 +2540,7 @@ function closeHistory() {
   document.getElementById('historyBackdrop').classList.remove('visible');
 }
 async function clearHistory() {
-  if (!confirm('¿Borrar todo el historial de semanas?')) return;
+  if (!(await confirmDialog('¿Borrar todo el historial de semanas archivadas?', { title: 'Borrar historial', confirmText: 'Borrar', danger: true }))) return;
   await idb.clear(STORE_HISTORY);
   await loadHistory();
   renderHistory();
@@ -2587,11 +2666,11 @@ function importRecipeFromText() {
   showToast('Receta importada · revísala y guarda');
 }
 
-// ============ CREAR PLATO CON IA (Gemini, BYOK) ============
-// Llama a la API de Gemini desde el navegador con la clave del usuario y pide el
-// plato como JSON estructurado (responseSchema). El resultado se sanea y
-// pre-rellena el modal con openCreateDish(prefill). La clave nunca sale del
-// dispositivo salvo hacia Google. El endpoint admite CORS con la key en query.
+// ============ FUNCIONES DE IA (crear plato, despensa, etiquetas, semana) ============
+// El proveedor activo (Gemini/Claude/OpenAI) y su clave salen de la sección de
+// arriba. Cada función pide JSON estructurado, lo sanea y lo aplica. El esquema
+// `AI_DISH_SCHEMA` está en formato Gemini (responseSchema); para Claude/OpenAI se
+// fuerza JSON por prompt + extractJson.
 const AI_DISH_SCHEMA = {
   type: 'OBJECT',
   properties: {
@@ -2627,28 +2706,129 @@ function fileToBase64(file) {
   });
 }
 
-async function callGemini(parts) {
-  if (!state.geminiApiKey) throw new Error('NO_KEY');
-  const model = 'gemini-2.0-flash';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(state.geminiApiKey)}`;
-  const body = {
-    contents: [{ parts }],
-    generationConfig: { responseMimeType: 'application/json', responseSchema: AI_DISH_SCHEMA, temperature: 0.4 }
-  };
+// Extrae JSON tolerando vallas ```json o texto alrededor (Claude/OpenAI a veces
+// envuelven). Lanza si no hay JSON parseable.
+function extractJson(text) {
+  if (!text) throw new Error('respuesta vacía de la IA');
+  const t = String(text).trim();
+  try { return JSON.parse(t); } catch {}
+  const unfenced = t.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+  try { return JSON.parse(unfenced); } catch {}
+  const m = t.match(/[{[][\s\S]*[}\]]/);
+  if (m) { try { return JSON.parse(m[0]); } catch {} }
+  throw new Error('la IA no devolvió JSON válido');
+}
+
+async function aiError(res) {
+  let msg = `error ${res.status}`;
+  try {
+    const e = await res.json();
+    msg = e?.error?.message || e?.error?.type || e?.message || msg;
+  } catch {}
+  return new Error(msg);
+}
+
+// `parts` neutral: lista de {text} y/o {image:{mime,data}}. Cada backend admite
+// llamadas directas desde el navegador (BYOK).
+async function callGemini(key, system, parts, schema) {
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${AI_PROVIDERS.gemini.model}:generateContent?key=${encodeURIComponent(key)}`;
+  const gParts = [];
+  if (system) gParts.push({ text: system });
+  for (const p of parts) {
+    if (p.text) gParts.push({ text: p.text });
+    if (p.image) gParts.push({ inline_data: { mime_type: p.image.mime, data: p.image.data } });
+  }
+  const generationConfig = { responseMimeType: 'application/json', temperature: 0.4 };
+  if (schema) generationConfig.responseSchema = schema;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify({ contents: [{ parts: gParts }], generationConfig })
   });
-  if (!res.ok) {
-    let msg = `error ${res.status}`;
-    try { const e = await res.json(); if (e?.error?.message) msg = e.error.message; } catch {}
-    throw new Error(msg);
-  }
+  if (!res.ok) throw await aiError(res);
   const data = await res.json();
-  const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
-  if (!text) throw new Error('respuesta vacía de la IA');
-  return JSON.parse(text);
+  return extractJson((data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join(''));
+}
+
+async function callClaude(key, system, parts) {
+  const content = [];
+  for (const p of parts) {
+    if (p.text) content.push({ type: 'text', text: p.text });
+    if (p.image) content.push({ type: 'image', source: { type: 'base64', media_type: p.image.mime, data: p.image.data } });
+  }
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': '2023-06-01',
+      'anthropic-dangerous-direct-browser-access': 'true'
+    },
+    body: JSON.stringify({
+      model: AI_PROVIDERS.claude.model,
+      max_tokens: 1500,
+      system: (system || '') + '\nResponde SOLO con el JSON, sin texto adicional ni vallas de código.',
+      messages: [{ role: 'user', content }]
+    })
+  });
+  if (!res.ok) throw await aiError(res);
+  const data = await res.json();
+  return extractJson((data?.content || []).filter(b => b.type === 'text').map(b => b.text).join(''));
+}
+
+async function callOpenAI(key, system, parts) {
+  const userContent = [];
+  for (const p of parts) {
+    if (p.text) userContent.push({ type: 'text', text: p.text });
+    if (p.image) userContent.push({ type: 'image_url', image_url: { url: `data:${p.image.mime};base64,${p.image.data}` } });
+  }
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
+    body: JSON.stringify({
+      model: AI_PROVIDERS.openai.model,
+      messages: [{ role: 'system', content: system || '' }, { role: 'user', content: userContent }],
+      response_format: { type: 'json_object' },
+      temperature: 0.4
+    })
+  });
+  if (!res.ok) throw await aiError(res);
+  const data = await res.json();
+  return extractJson(data?.choices?.[0]?.message?.content || '');
+}
+
+// Punto de entrada único: despacha al proveedor activo. Lanza 'NO_KEY' si falta.
+async function callAI({ system, parts, geminiSchema }) {
+  const key = activeAiKey();
+  if (!key) throw new Error('NO_KEY');
+  if (state.aiProvider === 'claude') return callClaude(key, system, parts);
+  if (state.aiProvider === 'openai') return callOpenAI(key, system, parts);
+  return callGemini(key, system, parts, geminiSchema);
+}
+
+// Construye los `parts` neutrales desde texto y/o un <input type=file>.
+async function aiPartsFrom(text, fileInputId) {
+  const parts = [];
+  if (text) parts.push({ text });
+  const fileInput = fileInputId ? document.getElementById(fileInputId) : null;
+  const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+  if (file) parts.push({ image: { mime: file.type || 'image/jpeg', data: await fileToBase64(file) } });
+  return parts;
+}
+
+// Envuelve una acción de IA: deshabilita el botón con un texto de "ocupado" y
+// gestiona los errores (incluido NO_KEY) con un toast uniforme.
+async function withAiBusy(btn, label, fn) {
+  const prev = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.textContent = label; }
+  try {
+    await fn();
+  } catch (err) {
+    if (err && err.message === 'NO_KEY') { showToast('Configura una clave de IA en Ajustes'); openDrawer(); }
+    else showToast(`IA (${activeProvider().name}): ${(err && err.message) || 'error'}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = prev; }
+  }
 }
 
 // Convierte la respuesta cruda de la IA en un prefill seguro para openCreateDish:
@@ -2686,47 +2866,132 @@ function sanitizeAiDishToPrefill(raw) {
   };
 }
 
+// Botón «Crear con IA» del modal Importar (texto y/o foto).
 async function generateDishWithAI() {
-  if (!state.geminiApiKey) {
-    showToast('Configura tu clave de Gemini en Ajustes');
-    closeImport();
-    openDrawer();
-    return;
-  }
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); closeImport(); openDrawer(); return; }
   const text = document.getElementById('aiText').value.trim();
   const fileInput = document.getElementById('aiImage');
-  const file = fileInput && fileInput.files ? fileInput.files[0] : null;
-  if (!text && !file) { showToast('Escribe algo o adjunta una foto'); return; }
-
-  const btn = document.getElementById('aiGenerateBtn');
-  const prevHtml = btn ? btn.innerHTML : '';
-  if (btn) { btn.disabled = true; btn.textContent = 'Generando…'; }
-  try {
-    const parts = [{ text: AI_DISH_PROMPT + (text ? `\n\nPetición del usuario:\n${text}` : '') }];
-    if (file) {
-      const b64 = await fileToBase64(file);
-      parts.push({ inline_data: { mime_type: file.type || 'image/jpeg', data: b64 } });
-    }
-    const raw = await callGemini(parts);
+  const hasImage = !!(fileInput && fileInput.files && fileInput.files[0]);
+  if (!text && !hasImage) { showToast('Escribe algo o adjunta una foto'); return; }
+  await withAiBusy(document.getElementById('aiGenerateBtn'), 'Generando…', async () => {
+    const parts = await aiPartsFrom(text || 'Crea un plato a partir de esta foto.', 'aiImage');
+    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA });
     const prefill = sanitizeAiDishToPrefill(raw);
-    if (!prefill.name && prefill.ingredients.length === 0) {
-      showToast('La IA no devolvió un plato válido');
-      return;
-    }
+    if (!prefill.name && prefill.ingredients.length === 0) { showToast('La IA no devolvió un plato válido'); return; }
     closeImport();
     openCreateDish(prefill);
     showToast('Plato sugerido por IA · revísalo y guarda');
-  } catch (err) {
-    if (err && err.message === 'NO_KEY') {
-      showToast('Configura tu clave de Gemini en Ajustes');
-      closeImport();
-      openDrawer();
-    } else {
-      showToast('IA: ' + ((err && err.message) || 'error al generar'));
+  });
+}
+
+// Botón «Sugerir plato con lo que tengo» del modal Despensa.
+async function suggestDishFromPantry() {
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); closePantry(); openDrawer(); return; }
+  if (state.pantry.length === 0) { showToast('Tu despensa está vacía'); return; }
+  const list = state.pantry.map(p => p.name).join(', ');
+  await withAiBusy(document.getElementById('pantrySuggestBtn'), 'Pensando…', async () => {
+    const parts = [{ text: `Propón un plato que use sobre todo estos ingredientes que ya tengo en casa: ${list}. Puedes añadir 1-2 ingredientes básicos si hace falta.` }];
+    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA });
+    const prefill = sanitizeAiDishToPrefill(raw);
+    if (!prefill.name && prefill.ingredients.length === 0) { showToast('La IA no devolvió un plato válido'); return; }
+    closePantry();
+    openCreateDish(prefill);
+    showToast('Plato sugerido con tu despensa · revísalo y guarda');
+  });
+}
+
+// Botón «Sugerir etiquetas con IA» del modal de plato: rellena tags + contiene a
+// partir del nombre y los ingredientes ya escritos (no toca nada más).
+const AI_TAGS_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    tags: { type: 'ARRAY', items: { type: 'STRING' } },
+    contains: { type: 'ARRAY', items: { type: 'STRING', enum: ['carne', 'pescado', 'gluten', 'lactosa', 'huevo', 'frutossecos'] } }
+  },
+  required: ['tags', 'contains']
+};
+
+async function suggestTagsWithAI() {
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); return; }
+  const name = document.getElementById('dishName').value.trim();
+  const ings = state.modalIngredients.map(i => i.name).join(', ');
+  if (!name && !ings) { showToast('Añade nombre o ingredientes primero'); return; }
+  const allowed = availableTags().join(', ');
+  await withAiBusy(document.getElementById('aiSuggestTags'), '…', async () => {
+    const system = `Clasificas platos. Devuelve JSON {tags, contains}. "tags": elige SOLO de esta lista las que apliquen (no inventes): ${allowed}. "contains": SOLO los presentes entre carne, pescado, gluten, lactosa, huevo, frutossecos.`;
+    const parts = [{ text: `Plato: ${name}\nIngredientes: ${ings}` }];
+    const raw = await callAI({ system, parts, geminiSchema: AI_TAGS_SCHEMA });
+    const lowerMap = new Map(availableTags().map(t => [normName(t), t]));
+    const newTags = (Array.isArray(raw?.tags) ? raw.tags : [])
+      .map(t => typeof t === 'string' ? lowerMap.get(normName(t)) : null).filter(Boolean);
+    const newContains = (Array.isArray(raw?.contains) ? raw.contains : [])
+      .map(c => {
+        if (typeof c !== 'string') return null;
+        const k = normName(c);
+        const f = CONTAINS_FLAGS.find(x => x.id === k) || CONTAINS_FLAGS.find(x => normName(x.label) === k);
+        return f ? f.id : null;
+      }).filter(Boolean);
+    let added = 0;
+    newTags.forEach(t => { if (!state.modalTags.some(x => normName(x) === normName(t))) { state.modalTags.push(t); added++; } });
+    newContains.forEach(c => { if (!state.modalContains.includes(c)) { state.modalContains.push(c); added++; } });
+    renderModalTags();
+    renderModalContains();
+    showToast(added > 0 ? `IA: ${added} sugerencia(s) añadidas` : 'IA: nada nuevo que sugerir');
+  });
+}
+
+// Botón «Sugerir con IA» de la vista Semana: la IA reparte tus platos del
+// recetario (solo principales) en 7 días buscando variedad. Lo no resuelto cae a
+// la selección ponderada normal. Archiva la semana saliente como «Generar».
+const AI_WEEK_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    days: {
+      type: 'ARRAY',
+      items: { type: 'OBJECT', properties: { lunch: { type: 'STRING' }, dinner: { type: 'STRING' } }, required: ['lunch', 'dinner'] }
     }
-  } finally {
-    if (btn) { btn.disabled = false; btn.innerHTML = prevHtml; }
-  }
+  },
+  required: ['days']
+};
+
+async function suggestWeekWithAI() {
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); openDrawer(); return; }
+  await loadDishes();
+  const lunches = lunchMainPool();
+  const dinners = dinnerPool();
+  if (lunches.length === 0) { showToast('Necesitas un plato de comida (revisa archivados/restricciones/estación)'); return; }
+  if (dinners.length === 0) { showToast('Necesitas un plato de cena (revisa archivados/restricciones/estación)'); return; }
+
+  const fmt = d => `${d.name}${(d.tags && d.tags.length) ? ` [${d.tags.join(', ')}]` : ''}`;
+  await withAiBusy(document.getElementById('suggestWeekBtn'), 'Planificando…', async () => {
+    const system = `Planificas un menú semanal variado y equilibrado (7 días, Lunes a Domingo). Para cada día elige UNA comida y UNA cena de las listas dadas, usando EXACTAMENTE el nombre tal cual aparece. No repitas el mismo plato en días seguidos ni abuses de la misma etiqueta/proteína; prioriza la variedad. Devuelve JSON {days:[{lunch,dinner} ×7]}.`;
+    const parts = [{ text: `COMIDAS disponibles:\n- ${lunches.map(fmt).join('\n- ')}\n\nCENAS disponibles:\n- ${dinners.map(fmt).join('\n- ')}` }];
+    const raw = await callAI({ system, parts, geminiSchema: AI_WEEK_SCHEMA });
+    const days = Array.isArray(raw?.days) ? raw.days : [];
+    const lunchByName = new Map(lunches.map(d => [normName(d.name), d]));
+    const dinnerByName = new Map(dinners.map(d => [normName(d.name), d]));
+
+    await archiveCurrentWeek();
+    await loadHistory();
+    const week = Array.from({ length: 7 }, () => emptyDay());
+    for (let i = 0; i < 7; i++) {
+      const sel = days[i] || {};
+      const lunchDish = (typeof sel.lunch === 'string' && lunchByName.get(normName(sel.lunch)))
+        || weightedPick(lunches, x => scoreDish(x, week, i, 'lunch'));
+      const dinnerDish = (typeof sel.dinner === 'string' && dinnerByName.get(normName(sel.dinner)))
+        || weightedPick(dinners, x => scoreDish(x, week, i, 'dinner'));
+      if (lunchDish) week[i].lunch = lunchDish.id;
+      ensureStarter(week, i);
+      if (dinnerDish) week[i].dinner = dinnerDish.id;
+    }
+
+    state.week = week;
+    state.weekGeneratedAt = Date.now();
+    await persistWeek();
+    await buildShoppingList();
+    renderWeek();
+    showToast('Semana sugerida por IA');
+  });
 }
 
 // ============ EXPORT / IMPORT ============
@@ -2837,7 +3102,7 @@ async function importData(file) {
   const msg = rejected > 0
     ? `Esto reemplazará TODOS tus datos actuales. Se descartarán ${rejected} platos malformados. ¿Continuar?`
     : 'Esto reemplazará TODOS tus datos actuales (platos, semana, lista, tema). ¿Continuar?';
-  if (!confirm(msg)) return;
+  if (!(await confirmDialog(msg, { title: 'Importar datos', confirmText: 'Importar', danger: true }))) return;
 
   try {
     // Una sola transacción sobre los 6 stores: o todo o nada.
@@ -2889,7 +3154,7 @@ async function importData(file) {
     await loadShowSources();
     await loadRestrictions();
     await loadToggles();
-    await loadGeminiKey();
+    await loadAiSettings();
     await loadPantry();
     await loadHistory();
     applySeasonChip();
@@ -2919,7 +3184,7 @@ async function init() {
     await loadShowSources();
     await loadRestrictions();
     await loadToggles();
-    await loadGeminiKey();
+    await loadAiSettings();
     await loadPantry();
     await loadHistory();
     initTabs();
@@ -2975,12 +3240,18 @@ async function init() {
     document.getElementById('importUrlBtn').addEventListener('click', importRecipeFromUrl);
     document.getElementById('importTextBtn').addEventListener('click', importRecipeFromText);
     document.getElementById('aiGenerateBtn')?.addEventListener('click', generateDishWithAI);
+    document.getElementById('pantrySuggestBtn')?.addEventListener('click', suggestDishFromPantry);
+    document.getElementById('suggestWeekBtn')?.addEventListener('click', suggestWeekWithAI);
+    document.getElementById('aiSuggestTags')?.addEventListener('click', suggestTagsWithAI);
 
-    // Clave de Gemini (IA)
-    document.getElementById('saveGeminiKey')?.addEventListener('click', saveGeminiKeyFromInput);
-    document.getElementById('clearGeminiKey')?.addEventListener('click', clearGeminiKey);
-    document.getElementById('geminiKey')?.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') { e.preventDefault(); saveGeminiKeyFromInput(); }
+    // IA: selector de proveedor + clave
+    document.querySelectorAll('.seg-option[data-ai-provider]').forEach(btn => {
+      btn.addEventListener('click', () => setAiProvider(btn.dataset.aiProvider));
+    });
+    document.getElementById('saveAiKey')?.addEventListener('click', saveAiKeyFromInput);
+    document.getElementById('clearAiKey')?.addEventListener('click', clearActiveAiKey);
+    document.getElementById('aiKey')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); saveAiKeyFromInput(); }
     });
 
     // Compartir lista de la compra
@@ -2992,6 +3263,11 @@ async function init() {
     document.getElementById('dishForm').addEventListener('submit', saveDish);
     document.getElementById('addIngredient').addEventListener('click', addIngredient);
     document.getElementById('deleteDish').addEventListener('click', deleteDish);
+    document.getElementById('archiveDish')?.addEventListener('click', toggleArchiveDish);
+    document.getElementById('toggleArchived')?.addEventListener('click', () => {
+      state.showArchived = !state.showArchived;
+      renderDishes();
+    });
     document.getElementById('generateWeek').addEventListener('click', generateWeek);
     document.getElementById('clearChecks').addEventListener('click', clearChecks);
 
@@ -3032,6 +3308,8 @@ async function init() {
 
     document.addEventListener('keydown', (e) => {
       if (e.key !== 'Escape') return;
+      // El modal de confirmación gestiona su propio Escape (fase de captura).
+      if (document.getElementById('confirmBackdrop')?.classList.contains('visible')) return;
       const vis = (id) => document.getElementById(id).classList.contains('visible');
       if (vis('modalBackdrop')) hideModal();
       else if (vis('importBackdrop')) closeImport();
