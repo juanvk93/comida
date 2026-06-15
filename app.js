@@ -4,7 +4,7 @@
 
 // ============ INDEXED DB ============
 const DB_NAME = 'mise-db';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 const STORE_DISHES = 'dishes';
 const STORE_WEEK = 'week';
 const STORE_SHOPPING = 'shopping';
@@ -100,6 +100,21 @@ function openDB() {
           cursor.continue();
         };
       }
+
+      // v5 -> v6: backfill `archived: false` en cada plato.
+      if (oldVersion < 6) {
+        const store = upgradeTx.objectStore(STORE_DISHES);
+        store.openCursor().onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (!cursor) return;
+          const dish = cursor.value;
+          if (typeof dish.archived !== 'boolean') {
+            dish.archived = false;
+            cursor.update(dish);
+          }
+          cursor.continue();
+        };
+      }
     };
   });
 }
@@ -144,6 +159,7 @@ let state = {
   spicesShopping: [],
   filter: 'all',
   tagFilter: null,     // null = sin filtro de etiqueta; string = nombre del tag activo
+  showArchived: false, // vista Platos: mostrar solo archivados (toggle de sesión)
   search: '',          // buscador de la vista Platos (nombre o ingrediente)
   theme: 'dark',
   accent: 'indigo',    // clave de ACCENTS; 'indigo' usa los valores por defecto del CSS
@@ -165,17 +181,27 @@ let state = {
   modalRating: 0,      // valoración del plato en edición (0–5)
   modalYields: 1,      // raciones (comidas que rinde) del plato en edición
   customTags: [],
-  drag: null           // estado transitorio del drag & drop en la semana
+  aiProvider: 'gemini',  // proveedor de IA activo: 'gemini' | 'claude' | 'openai'
+  geminiApiKey: '',      // claves BYOK por proveedor (se guardan solo en este dispositivo)
+  claudeApiKey: '',
+  openaiApiKey: '',
+  drag: null             // estado transitorio del drag & drop en la semana
 };
 
 // ============ UTILS ============
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
+// Clave de identidad insensible a mayúsculas/minúsculas para nombres
+// (ingredientes, especias, despensa, etiquetas): minúsculas, sin espacios
+// sobrantes y con espacios internos colapsados. "Sal", "SAL" y " sal " → "sal".
+// No quita acentos a propósito (café ≠ cafe).
+const normName = (s) => String(s == null ? '' : s).toLowerCase().trim().replace(/\s+/g, ' ');
+
 const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo'];
 
 const BUILTIN_TAGS = ['pasta', 'arroz', 'legumbre', 'pescado', 'carne', 'ave', 'huevo', 'verdura', 'sopa', 'ensalada'];
 
-const APP_VERSION = '1.5.0';
+const APP_VERSION = '1.6.0';
 
 // Paleta curada de acentos. `indigo` (por defecto) no define vars: deja que el
 // CSS aplique los valores afinados por tema (dark/light) de :root. El resto
@@ -202,6 +228,13 @@ const ACCENTS = {
 
 // Historial de cambios. El primero es el más reciente y se marca como "actual".
 const CHANGELOG = [
+  { version: '1.6.0', date: 'Junio 2026', items: [
+    'Crear platos con IA (Gemini): descríbelo o haz una foto y se rellena el formulario solo.',
+    'Reordenar la semana arrastrando días completos, no solo platos sueltos.',
+    'Botón para borrar todos los platos de una vez (Ajustes › Datos).',
+    'Los ingredientes iguales se agrupan aunque cambien las mayúsculas (sal = Sal = SAL).',
+    'Sin parpadeo claro/oscuro al abrir la app.'
+  ]},
   { version: '1.5.0', date: 'Junio 2026', items: [
     'Fijar platos (📌) en la semana: «Generar» respeta lo fijado y rellena el resto.',
     'Restricciones alimentarias como filtro duro (vegetariano, sin gluten, sin lácteos…).',
@@ -250,7 +283,7 @@ function availableTags() {
   const seen = new Set();
   const out = [];
   for (const t of [...BUILTIN_TAGS, ...state.customTags]) {
-    const k = t.toLowerCase();
+    const k = normName(t);
     if (seen.has(k)) continue;
     seen.add(k);
     out.push(t);
@@ -445,7 +478,7 @@ function computeRecentDishIds() {
 
 // Conjunto de nombres (lowercase) de ingredientes en la despensa.
 function pantrySet() {
-  return new Set(state.pantry.map(p => p.name.toLowerCase().trim()));
+  return new Set(state.pantry.map(p => normName(p.name)));
 }
 
 function applyShowSourcesCheckbox() {
@@ -489,6 +522,10 @@ async function loadAccent() {
 
 function applyTheme() {
   document.body.dataset.theme = state.theme;
+  // Sincroniza <html> (lo fija el script de pre-pintado) y deja una pista en
+  // localStorage para que la próxima carga no parpadee dark→light.
+  document.documentElement.dataset.theme = state.theme;
+  try { localStorage.setItem('mimenu-theme', state.theme); } catch (e) {}
   document.querySelector('meta[name="theme-color"]').setAttribute(
     'content', state.theme === 'dark' ? '#131313' : '#ffffff'
   );
@@ -521,7 +558,7 @@ function renderAccentSwatches() {
     const active = state.accent === key;
     return `<button type="button" class="accent-swatch ${active ? 'active' : ''}"
       data-accent="${key}" style="--swatch:${preset.swatch}"
-      title="${escapeHtml(preset.name)}" aria-label="${escapeHtml(preset.name)}"
+      title="${escapeAttr(preset.name)}" aria-label="${escapeAttr(preset.name)}"
       aria-pressed="${active}"></button>`;
   }).join('');
   container.querySelectorAll('.accent-swatch').forEach(btn => {
@@ -552,6 +589,7 @@ function openDrawer() {
   drawer.setAttribute('aria-hidden', 'false');
   document.getElementById('menuToggle').setAttribute('aria-expanded', 'true');
   updateStorageStatus();
+  updateGeminiStatus();
 }
 
 function closeDrawer() {
@@ -602,6 +640,47 @@ function initToggles() {
     applyToggleButtons();
     await idb.put(STORE_SETTINGS, { key: 'useHistory', value: state.useHistory });
   });
+}
+
+// ============ CLAVE DE GEMINI (IA, BYOK) ============
+// La clave del usuario se guarda solo en este dispositivo (settings). Nunca se
+// muestra de vuelta en el input (se deja vacío); el estado se refleja en el
+// texto de `geminiStatus`. Guardar con el campo vacío NO borra la clave: para
+// eso está el botón «Borrar».
+async function loadGeminiKey() {
+  const s = await idb.get(STORE_SETTINGS, 'geminiApiKey');
+  state.geminiApiKey = typeof s?.value === 'string' ? s.value : '';
+}
+
+async function saveGeminiKeyFromInput() {
+  const input = document.getElementById('geminiKey');
+  if (!input) return;
+  const v = input.value.trim();
+  if (!v) { showToast('Pega tu clave de Gemini (o usa «Borrar»)'); return; }
+  state.geminiApiKey = v;
+  await idb.put(STORE_SETTINGS, { key: 'geminiApiKey', value: v });
+  input.value = '';
+  updateGeminiStatus();
+  showToast('Clave de Gemini guardada');
+}
+
+async function clearGeminiKey() {
+  state.geminiApiKey = '';
+  const input = document.getElementById('geminiKey');
+  if (input) input.value = '';
+  await idb.put(STORE_SETTINGS, { key: 'geminiApiKey', value: '' });
+  updateGeminiStatus();
+  showToast('Clave de Gemini eliminada');
+}
+
+function updateGeminiStatus() {
+  const el = document.getElementById('geminiStatus');
+  if (!el) return;
+  const has = !!state.geminiApiKey;
+  el.textContent = has
+    ? 'Clave configurada ✓ — ya puedes usar «Crear con IA» al importar.'
+    : 'Sin clave: «Crear con IA» te pedirá configurarla.';
+  el.classList.toggle('ok', has);
 }
 
 // ============ CHANGELOG ============
@@ -692,6 +771,7 @@ async function loadDishes() {
     if (!Array.isArray(d.contains)) d.contains = [];
     if (typeof d.rating !== 'number') d.rating = 0;
     if (typeof d.yields !== 'number' || d.yields < 1) d.yields = 1;
+    if (typeof d.archived !== 'boolean') d.archived = false;
   });
   state.dishes.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
   renderDishes();
@@ -701,19 +781,26 @@ function renderDishes() {
   const grid = document.getElementById('dishesGrid');
   const empty = document.getElementById('emptyDishes');
 
-  // Counts
-  document.getElementById('countAll').textContent = state.dishes.length;
-  document.getElementById('countLunch').textContent = state.dishes.filter(d => d.type === 'comida' || d.type === 'ambos').length;
-  document.getElementById('countDinner').textContent = state.dishes.filter(d => d.type === 'cena' || d.type === 'ambos').length;
+  const activeDishes = state.dishes.filter(d => !d.archived);
+  const archivedDishes = state.dishes.filter(d => d.archived);
+  // Si dejas de tener archivados mientras los veías, vuelve a la vista normal.
+  if (state.showArchived && archivedDishes.length === 0) state.showArchived = false;
 
-  // Filter por tipo (chips superiores)
-  let filtered = state.dishes;
-  if (state.filter === 'comida') filtered = state.dishes.filter(d => d.type === 'comida' || d.type === 'ambos');
-  if (state.filter === 'cena') filtered = state.dishes.filter(d => d.type === 'cena' || d.type === 'ambos');
+  // Counts (siempre sobre platos activos, no archivados)
+  document.getElementById('countAll').textContent = activeDishes.length;
+  document.getElementById('countLunch').textContent = activeDishes.filter(d => d.type === 'comida' || d.type === 'ambos').length;
+  document.getElementById('countDinner').textContent = activeDishes.filter(d => d.type === 'cena' || d.type === 'ambos').length;
+  renderArchivedToggle(archivedDishes.length);
+
+  // Base: archivados o activos según el toggle; luego cascada de tipo.
+  let filtered = state.showArchived ? archivedDishes : activeDishes;
+  if (state.filter === 'comida') filtered = filtered.filter(d => d.type === 'comida' || d.type === 'ambos');
+  if (state.filter === 'cena') filtered = filtered.filter(d => d.type === 'cena' || d.type === 'ambos');
 
   // Filter por etiqueta (segunda fila de chips)
   if (state.tagFilter) {
-    filtered = filtered.filter(d => Array.isArray(d.tags) && d.tags.includes(state.tagFilter));
+    const tf = normName(state.tagFilter);
+    filtered = filtered.filter(d => Array.isArray(d.tags) && d.tags.some(t => normName(t) === tf));
   }
 
   // Buscador: por nombre, ingrediente o etiqueta.
@@ -737,8 +824,11 @@ function renderDishes() {
   empty.classList.remove('visible');
 
   if (filtered.length === 0) {
+    const msg = q ? 'Ningún plato coincide con la búsqueda.'
+      : state.showArchived ? 'No tienes platos archivados.'
+      : 'No hay platos en esta categoría todavía.';
     grid.innerHTML = `<div class="empty-state visible" style="grid-column:1/-1;padding:60px 20px;">
-      <p>${q ? 'Ningún plato coincide con la búsqueda.' : 'No hay platos en esta categoría todavía.'}</p>
+      <p>${msg}</p>
     </div>`;
     return;
   }
@@ -762,7 +852,7 @@ function renderDishes() {
     return `
       <article class="dish-card" data-id="${dish.id}">
         <div class="dish-card-top">
-          <div class="dish-type">${typeLabel}</div>
+          <div class="dish-type">${typeLabel}${dish.archived ? ' · archivado' : ''}</div>
           ${ratingStars(dish.rating || 0)}
         </div>
         <h3 class="dish-name">${escapeHtml(dish.name)}</h3>
@@ -794,18 +884,43 @@ function initSearch() {
   });
 }
 
+// Chip «Archivados (N)»: visible solo si hay archivados o si ya los estás viendo.
+function renderArchivedToggle(count) {
+  const btn = document.getElementById('toggleArchived');
+  if (!btn) return;
+  const countEl = document.getElementById('countArchived');
+  if (countEl) countEl.textContent = count;
+  btn.hidden = count === 0 && !state.showArchived;
+  btn.classList.toggle('active', state.showArchived);
+  btn.setAttribute('aria-pressed', state.showArchived ? 'true' : 'false');
+}
+
+// Para TEXTO dentro de nodos. No escapa comillas (innerHTML no las codifica),
+// por lo que NO es seguro para valores dentro de atributos: usa escapeAttr.
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
   return div.innerHTML;
 }
 
+// Para valores dentro de ATRIBUTOS HTML entre comillas. Escapa además " y ' para
+// que un nombre con comillas (p. ej. un ingrediente importado) no rompa el
+// atributo ni permita inyección.
+function escapeAttr(str) {
+  return String(str == null ? '' : str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function initFilters() {
   // Solo los chips de tipo (la fila tagFilters se genera dinámicamente
   // con sus propios handlers).
-  document.querySelectorAll('#view-dishes > .filters:not(.tag-filters) .chip').forEach(chip => {
+  document.querySelectorAll('#view-dishes > .filters:not(.tag-filters) .chip:not(.toggle-archived)').forEach(chip => {
     chip.addEventListener('click', () => {
-      document.querySelectorAll('#view-dishes > .filters:not(.tag-filters) .chip')
+      document.querySelectorAll('#view-dishes > .filters:not(.tag-filters) .chip:not(.toggle-archived)')
         .forEach(c => c.classList.remove('active'));
       chip.classList.add('active');
       state.filter = chip.dataset.filter;
@@ -818,9 +933,13 @@ function renderTagFilters() {
   const container = document.getElementById('tagFilters');
   if (!container) return;
 
-  // Solo mostramos tags que algún plato use de verdad.
-  const used = new Set();
-  state.dishes.forEach(d => (d.tags || []).forEach(t => used.add(t)));
+  // Solo tags que use algún plato, deduplicadas sin distinguir mayúsculas
+  // (Pasta/pasta = una sola). Clave = normName; valor = primera grafía vista.
+  const used = new Map();
+  state.dishes.forEach(d => (d.tags || []).forEach(t => {
+    const k = normName(t);
+    if (k && !used.has(k)) used.set(k, t);
+  }));
 
   if (used.size === 0) {
     container.classList.remove('visible');
@@ -830,19 +949,20 @@ function renderTagFilters() {
     return;
   }
 
-  // Si el tag actualmente filtrado ya no existe, limpiamos.
-  if (state.tagFilter && !used.has(state.tagFilter)) {
+  // Si el tag actualmente filtrado ya no lo usa ningún plato, limpiamos.
+  if (state.tagFilter && !used.has(normName(state.tagFilter))) {
     state.tagFilter = null;
   }
 
   container.classList.add('visible');
-  const tags = Array.from(used).sort((a, b) => a.localeCompare(b, 'es'));
+  const tags = Array.from(used.values()).sort((a, b) => a.localeCompare(b, 'es'));
   const allActive = state.tagFilter === null;
+  const tfKey = state.tagFilter != null ? normName(state.tagFilter) : null;
   container.innerHTML = [
     `<button class="chip ${allActive ? 'active' : ''}" data-tag="">Todas</button>`,
     ...tags.map(t => {
-      const active = state.tagFilter === t;
-      return `<button class="chip ${active ? 'active' : ''}" data-tag="${escapeHtml(t)}">${escapeHtml(t)}</button>`;
+      const active = tfKey != null && tfKey === normName(t);
+      return `<button class="chip ${active ? 'active' : ''}" data-tag="${escapeAttr(t)}">${escapeHtml(t)}</button>`;
     })
   ].join('');
 
@@ -858,20 +978,28 @@ function renderTagFilters() {
 function openCreateDish(prefill = null) {
   state.editingDish = null;
   state.modalIngredients = prefill?.ingredients ? prefill.ingredients.map(i => ({ id: uid(), name: i.name, qty: i.qty || '' })) : [];
-  state.modalSpices = [];
-  state.modalTags = [];
-  state.modalContains = [];
+  state.modalSpices = prefill?.spices ? prefill.spices.map(s => ({ id: uid(), name: s.name, qty: s.qty || '' })) : [];
+  state.modalTags = Array.isArray(prefill?.tags) ? [...prefill.tags] : [];
+  state.modalContains = Array.isArray(prefill?.contains) ? [...prefill.contains] : [];
   state.modalRating = 0;
-  state.modalYields = 1;
-  document.getElementById('modalEyebrow').textContent = prefill ? 'Receta importada' : '';
+  state.modalYields = (typeof prefill?.yields === 'number' && prefill.yields >= 1) ? Math.min(4, prefill.yields) : 1;
+  document.getElementById('modalEyebrow').textContent = prefill ? (prefill.eyebrow || 'Receta importada') : '';
   document.getElementById('modalTitle').textContent = prefill?.name ? prefill.name : 'Nuevo plato';
   document.getElementById('dishId').value = '';
   document.getElementById('dishName').value = prefill?.name || '';
-  document.getElementById('dishDescription').value = '';
-  document.querySelector('input[name="dishType"][value="comida"]').checked = true;
-  document.querySelector('input[name="dishRole"][value="main"]').checked = true;
-  document.querySelector('input[name="dishSeason"][value="any"]').checked = true;
+  document.getElementById('dishDescription').value = prefill?.description || '';
+  // Marca el radio del valor pedido; si no es válido, cae al valor por defecto.
+  const setRadio = (name, value, fallback) => {
+    const el = document.querySelector(`input[name="${name}"][value="${value}"]`)
+      || document.querySelector(`input[name="${name}"][value="${fallback}"]`);
+    if (el) el.checked = true;
+  };
+  setRadio('dishType', prefill?.type, 'comida');
+  setRadio('dishRole', prefill?.role, 'main');
+  setRadio('dishSeason', prefill?.season, 'any');
   document.getElementById('deleteDish').hidden = true;
+  const archiveBtnNew = document.getElementById('archiveDish');
+  if (archiveBtnNew) archiveBtnNew.hidden = true;
   refreshIngredientSuggestions();
   renderModalIngredients();
   renderModalSpices();
@@ -911,6 +1039,8 @@ function openEditDish(id) {
   const season = dish.season || 'any';
   document.querySelector(`input[name="dishSeason"][value="${season}"]`).checked = true;
   document.getElementById('deleteDish').hidden = false;
+  const archiveBtnEdit = document.getElementById('archiveDish');
+  if (archiveBtnEdit) { archiveBtnEdit.hidden = false; archiveBtnEdit.textContent = dish.archived ? 'Desarchivar' : 'Archivar'; }
   refreshIngredientSuggestions();
   renderModalIngredients();
   renderModalSpices();
@@ -998,12 +1128,12 @@ function refreshIngredientSuggestions() {
   const seen = new Map();
   state.dishes.forEach(d => {
     (d.ingredients || []).forEach(i => {
-      const key = i.name.toLowerCase().trim();
+      const key = normName(i.name);
       if (key && !seen.has(key)) seen.set(key, i.name);
     });
   });
   const names = Array.from(seen.values()).sort((a, b) => a.localeCompare(b, 'es'));
-  datalist.innerHTML = names.map(n => `<option value="${escapeHtml(n)}"></option>`).join('');
+  datalist.innerHTML = names.map(n => `<option value="${escapeAttr(n)}"></option>`).join('');
 }
 
 function renderModalIngredients() {
@@ -1091,13 +1221,13 @@ function renderModalTags() {
   const container = document.getElementById('tagPicker');
   if (!container) return;
   container.innerHTML = availableTags().map(t => {
-    const active = state.modalTags.includes(t);
-    return `<button type="button" class="tag-chip ${active ? 'active' : ''}" data-tag="${escapeHtml(t)}" aria-pressed="${active}">${escapeHtml(t)}</button>`;
+    const active = state.modalTags.some(x => normName(x) === normName(t));
+    return `<button type="button" class="tag-chip ${active ? 'active' : ''}" data-tag="${escapeAttr(t)}" aria-pressed="${active}">${escapeHtml(t)}</button>`;
   }).join('');
   container.querySelectorAll('.tag-chip').forEach(btn => {
     btn.addEventListener('click', () => {
       const tag = btn.dataset.tag;
-      const idx = state.modalTags.indexOf(tag);
+      const idx = state.modalTags.findIndex(x => normName(x) === normName(tag));
       if (idx >= 0) state.modalTags.splice(idx, 1);
       else state.modalTags.push(tag);
       renderModalTags();
@@ -1113,12 +1243,12 @@ async function addCustomTag() {
   // se cuelen al `data-tag` del chip.
   const tag = input.value.trim().toLowerCase().replace(/[^a-z0-9áéíóúñü\s-]/g, '').trim();
   if (!tag) { showToast('Etiqueta no válida'); return; }
-  const exists = availableTags().some(t => t.toLowerCase() === tag);
+  const exists = availableTags().some(t => normName(t) === normName(tag));
   if (!exists) {
     state.customTags.push(tag);
     await idb.put(STORE_SETTINGS, { key: 'customTags', value: state.customTags });
   }
-  if (!state.modalTags.includes(tag)) state.modalTags.push(tag);
+  if (!state.modalTags.some(x => normName(x) === normName(tag))) state.modalTags.push(tag);
   input.value = '';
   renderModalTags();
   input.focus();
@@ -1150,7 +1280,11 @@ async function saveDish(e) {
     spices: state.modalSpices,
     createdAt: state.editingDish
       ? (state.dishes.find(d => d.id === state.editingDish)?.createdAt ?? Date.now())
-      : Date.now()
+      : Date.now(),
+    // Preservar el estado de archivado al editar (el form no lo expone).
+    archived: state.editingDish
+      ? (state.dishes.find(d => d.id === state.editingDish)?.archived || false)
+      : false
   };
 
   // Detectar renames (mismo id, distinto nombre) en ingredientes Y especias
@@ -1163,8 +1297,8 @@ async function saveDish(e) {
         for (const newItem of newList) {
           if (!newItem.id) continue;
           const oldItem = oldList.find(o => o.id === newItem.id);
-          if (oldItem && oldItem.name.toLowerCase() !== newItem.name.toLowerCase()) {
-            renames.set(oldItem.name.toLowerCase(), newItem.name.toLowerCase());
+          if (oldItem && normName(oldItem.name) !== normName(newItem.name)) {
+            renames.set(normName(oldItem.name), normName(newItem.name));
           }
         }
       };
@@ -1195,6 +1329,36 @@ async function deleteDish() {
   await loadDishes();
   hideModal();
   showToast('Plato eliminado');
+}
+
+// Borra TODO el recetario de una vez. Como la semana y la compra derivan de los
+// platos, también se vacían para no dejar referencias a ids inexistentes.
+async function deleteAllDishes() {
+  if (state.dishes.length === 0) { showToast('No hay platos que borrar'); return; }
+  if (!confirm(`¿Borrar TODOS los platos (${state.dishes.length})? También se vaciará la semana y la lista de la compra. No se puede deshacer.`)) return;
+  await idb.clear(STORE_DISHES);
+  await idb.clear(STORE_WEEK);
+  state.week = null;
+  state.weekGeneratedAt = null;
+  await loadDishes();
+  await buildShoppingList();   // con week=null vacía la compra y su store
+  renderWeek();
+  closeDrawer();
+  showToast('Platos, semana y compra borrados');
+}
+
+// Archiva / desarchiva el plato en edición. Archivar no lo borra: lo oculta del
+// recetario y lo excluye de la generación (via `eligible`), pero se conserva.
+async function toggleArchiveDish() {
+  if (!state.editingDish) return;
+  const dish = state.dishes.find(d => d.id === state.editingDish);
+  if (!dish) return;
+  dish.archived = !dish.archived;
+  await idb.put(STORE_DISHES, dish);
+  const archived = dish.archived;
+  await loadDishes();
+  hideModal();
+  showToast(archived ? 'Plato archivado' : 'Plato desarchivado');
 }
 
 // ============ WEEK GENERATION ============
@@ -1245,6 +1409,7 @@ async function loadWeek() {
 const REROLL_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12a9 9 0 1 1-3-6.7L21 8M21 3v5h-5"/></svg>`;
 const DELETE_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>`;
 const LOCK_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg>`;
+const DAY_DRAG_SVG = `<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="9" cy="5" r="1.6"/><circle cx="15" cy="5" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="19" r="1.6"/><circle cx="15" cy="19" r="1.6"/></svg>`;
 
 function renderWeek() {
   const grid = document.getElementById('weekGrid');
@@ -1260,16 +1425,19 @@ function renderWeek() {
   grid.classList.add('visible');
 
   // Reroll siempre disponible (también en slot vacío). Con contenido se añade
-  // fijar y eliminar. Si el slot está fijado, solo se ofrece desfijar.
-  const actions = (dayIdx, meal, has, locked, labels) => {
+  // fijar y eliminar. Si el slot está fijado, solo se ofrece desfijar. Las
+  // sobras no ofrecen fijar: dependen de su plato "lead", así que fijarlas por
+  // separado dejaría sobras huérfanas (sin cocinarse) al regenerar.
+  const actions = (dayIdx, meal, has, locked, leftover, labels) => {
     if (!has) {
       return `<div class="meal-actions"><button class="meal-action meal-reroll" data-day="${dayIdx}" data-meal="${meal}" aria-label="${labels.reroll}">${REROLL_SVG}</button></div>`;
     }
     if (locked) {
       return `<div class="meal-actions"><button class="meal-action meal-lock active" data-day="${dayIdx}" data-meal="${meal}" aria-label="Quitar fijado" title="Fijado · no cambia al generar">${LOCK_SVG}</button></div>`;
     }
+    const lockBtn = leftover ? '' : `<button class="meal-action meal-lock" data-day="${dayIdx}" data-meal="${meal}" aria-label="Fijar" title="Fijar · se mantiene al generar">${LOCK_SVG}</button>`;
     return `<div class="meal-actions">
-      <button class="meal-action meal-lock" data-day="${dayIdx}" data-meal="${meal}" aria-label="Fijar" title="Fijar · se mantiene al generar">${LOCK_SVG}</button>
+      ${lockBtn}
       <button class="meal-action meal-delete" data-day="${dayIdx}" data-meal="${meal}" aria-label="${labels.del}">${DELETE_SVG}</button>
       <button class="meal-action meal-reroll" data-day="${dayIdx}" data-meal="${meal}" aria-label="${labels.reroll}">${REROLL_SVG}</button>
     </div>`;
@@ -1295,28 +1463,29 @@ function renderWeek() {
     const lineCls = (meal) => `meal-line${L[meal] ? ' is-locked' : ''}`;
 
     return `
-      <article class="day-card${isWeekend ? ' is-weekend' : ''}">
+      <article class="day-card${isWeekend ? ' is-weekend' : ''}" data-day="${idx}">
         <div class="day-header">
           <h3 class="day-name">${DAYS[idx]}</h3>
+          <button type="button" class="day-drag-handle" data-day="${idx}" aria-label="Mover ${DAYS[idx]} (arrastrar para reordenar)" title="Arrastra para reordenar este día">${DAY_DRAG_SVG}</button>
         </div>
         <div class="meal-slot lunch-slot" data-day="${idx}">
           <span class="meal-label">Comida</span>
           ${showStarterLine ? `
             <div class="${lineCls('lunchStarter')} starter-line" data-day="${idx}" data-meal="lunchStarter">
               ${nameSpan('meal-starter', idx, 'lunchStarter', starterDish, LO.lunchStarter, L.lunchStarter, 'Sin entrante')}
-              ${actions(idx, 'lunchStarter', !!starterDish, L.lunchStarter, { del: 'Eliminar entrante', reroll: 'Cambiar entrante' })}
+              ${actions(idx, 'lunchStarter', !!starterDish, L.lunchStarter, LO.lunchStarter, { del: 'Eliminar entrante', reroll: 'Cambiar entrante' })}
             </div>
           ` : ''}
           <div class="${lineCls('lunch')} main-line" data-day="${idx}" data-meal="lunch">
             ${nameSpan('meal-dish', idx, 'lunch', lunchDish, LO.lunch, L.lunch, 'Sin asignar')}
-            ${actions(idx, 'lunch', !!lunchDish, L.lunch, { del: 'Eliminar comida', reroll: 'Cambiar comida' })}
+            ${actions(idx, 'lunch', !!lunchDish, L.lunch, LO.lunch, { del: 'Eliminar comida', reroll: 'Cambiar comida' })}
           </div>
         </div>
         <div class="meal-slot dinner-slot" data-day="${idx}">
           <span class="meal-label">Cena</span>
           <div class="${lineCls('dinner')}" data-day="${idx}" data-meal="dinner">
             ${nameSpan('meal-dish', idx, 'dinner', dinnerDish, LO.dinner, L.dinner, 'Sin asignar')}
-            ${actions(idx, 'dinner', !!dinnerDish, L.dinner, { del: 'Eliminar cena', reroll: 'Cambiar cena' })}
+            ${actions(idx, 'dinner', !!dinnerDish, L.dinner, LO.dinner, { del: 'Eliminar cena', reroll: 'Cambiar cena' })}
           </div>
         </div>
       </article>
@@ -1325,6 +1494,7 @@ function renderWeek() {
 
   wireWeekActions(grid);
   initWeekDnd(grid);
+  initDayDnd(grid);
 }
 
 function wireWeekActions(grid) {
@@ -1341,7 +1511,7 @@ function wireWeekActions(grid) {
 
 async function toggleLock(dayIdx, meal) {
   const day = state.week[dayIdx];
-  if (!day[meal]) return;            // no tiene sentido fijar un hueco vacío
+  if (!day[meal] || day.leftover[meal]) return;   // ni huecos vacíos ni sobras
   day.locked[meal] = !day.locked[meal];
   await persistWeek();
   renderWeek();
@@ -1486,6 +1656,112 @@ async function moveDish(fromDay, fromMeal, toDay, toMeal) {
   showToast('Plato movido');
 }
 
+// ============ DRAG & DROP DE DÍAS (reordenar la semana) ============
+// Arrastrando el asa del encabezado se intercambia el contenido COMPLETO de dos
+// días. Es independiente del DnD de platos sueltos (que usa `.draggable-dish`).
+let dayDragCtx = null;
+
+function initDayDnd(grid) {
+  grid.querySelectorAll('.day-drag-handle').forEach(el => {
+    el.addEventListener('pointerdown', onDayDragStart);
+  });
+}
+
+function onDayDragStart(e) {
+  if (e.button != null && e.button > 0) return;   // solo botón principal / touch
+  const card = e.currentTarget.closest('.day-card');
+  if (!card) return;
+  dayDragCtx = {
+    fromDay: parseInt(card.dataset.day), card,
+    startX: e.clientX, startY: e.clientY,
+    active: false, ghost: null, lastTarget: null
+  };
+  window.addEventListener('pointermove', onDayDragMove, { passive: false });
+  window.addEventListener('pointerup', onDayDragEnd);
+  window.addEventListener('pointercancel', onDayDragEnd);
+  e.preventDefault();
+  e.stopPropagation();
+}
+
+function dayCardFromPoint(x, y) {
+  const el = document.elementFromPoint(x, y);
+  const card = el && el.closest ? el.closest('.day-card') : null;
+  return card && card.dataset.day != null ? card : null;
+}
+
+function onDayDragMove(e) {
+  if (!dayDragCtx) return;
+  const dx = e.clientX - dayDragCtx.startX, dy = e.clientY - dayDragCtx.startY;
+  if (!dayDragCtx.active) {
+    if (Math.hypot(dx, dy) < 8) return;   // umbral: distingue tap/scroll de drag
+    dayDragCtx.active = true;
+    document.body.classList.add('dragging-day');
+    dayDragCtx.card.classList.add('day-drag-source');
+    const g = document.createElement('div');
+    g.className = 'drag-ghost';
+    g.textContent = DAYS[dayDragCtx.fromDay];
+    document.body.appendChild(g);
+    dayDragCtx.ghost = g;
+  }
+  if (dayDragCtx.ghost) {
+    dayDragCtx.ghost.style.left = e.clientX + 'px';
+    dayDragCtx.ghost.style.top = e.clientY + 'px';
+  }
+  const target = dayCardFromPoint(e.clientX, e.clientY);
+  const valid = target && target !== dayDragCtx.card ? target : null;
+  if (dayDragCtx.lastTarget && dayDragCtx.lastTarget !== valid) dayDragCtx.lastTarget.classList.remove('day-drop-target');
+  if (valid) valid.classList.add('day-drop-target');
+  dayDragCtx.lastTarget = valid;
+  e.preventDefault();
+}
+
+async function onDayDragEnd(e) {
+  window.removeEventListener('pointermove', onDayDragMove);
+  window.removeEventListener('pointerup', onDayDragEnd);
+  window.removeEventListener('pointercancel', onDayDragEnd);
+  const ctx = dayDragCtx;
+  dayDragCtx = null;
+  if (!ctx) return;
+  document.body.classList.remove('dragging-day');
+  if (ctx.ghost) ctx.ghost.remove();
+  if (ctx.card) ctx.card.classList.remove('day-drag-source');
+  if (ctx.lastTarget) ctx.lastTarget.classList.remove('day-drop-target');
+  if (!ctx.active) return;
+  const target = dayCardFromPoint(e.clientX, e.clientY);
+  if (!target) return;
+  const toDay = parseInt(target.dataset.day);
+  if (toDay === ctx.fromDay) return;
+  await swapDays(ctx.fromDay, toDay);
+}
+
+// Promueve a "fresco" cualquier slot de sobras que quede huérfano (su día
+// anterior ya no cocina el mismo plato), p. ej. tras reordenar días. Así la
+// compra vuelve a contar ese plato y no quedan sobras sin su lead.
+function repairLeftovers() {
+  for (const meal of ['lunch', 'dinner']) {
+    for (let d = 0; d < state.week.length; d++) {
+      if (!state.week[d].leftover[meal]) continue;
+      const id = state.week[d][meal];
+      const prev = d > 0 ? state.week[d - 1] : null;
+      const chained = prev && id != null && prev[meal] === id;
+      if (!chained) state.week[d].leftover[meal] = false;
+    }
+  }
+}
+
+// Intercambia el contenido completo de dos días (comida, entrante, cena + flags).
+async function swapDays(fromIdx, toIdx) {
+  if (!state.week || fromIdx === toIdx) return;
+  const tmp = state.week[fromIdx];
+  state.week[fromIdx] = state.week[toIdx];
+  state.week[toIdx] = tmp;
+  repairLeftovers();
+  await persistWeek();
+  await buildShoppingList();
+  renderWeek();
+  showToast('Días intercambiados');
+}
+
 // Dos slots son adyacentes si comparten día (cualquier combinación
 // comida/entrante/cena dentro del mismo día) o si forman el "salto" temporal
 // cena(d) ↔ entrante/comida(d+1).
@@ -1573,7 +1849,7 @@ function matchesRestrictions(d) {
 
 // Pasa los dos filtros que afectan a TODOS los pools.
 function eligible(d) {
-  return matchesSeason(d) && matchesRestrictions(d);
+  return !d.archived && matchesSeason(d) && matchesRestrictions(d);
 }
 
 // Pools por tipo de slot. El "principal" de la comida acepta role 'main' o
@@ -1754,7 +2030,7 @@ function aggregateField(dishIds, fieldName) {
     });
     if (occurrences === 0) return;   // solo aparece como sobras → no se cocina
     (dish[fieldName] || []).forEach(item => {
-      const key = item.name.toLowerCase().trim();
+      const key = normName(item.name);
       if (!key) return;
       if (!aggregated.has(key)) {
         aggregated.set(key, { name: item.name, totals: new Map(), raws: new Map(), sources: new Map() });
@@ -1793,7 +2069,7 @@ function materializeShoppingItems(aggregated, previousChecked, kind) {
       name: item.name,
       qty: parts.join(' + '),
       sources,
-      checked: previousChecked.get(item.name.toLowerCase()) || false
+      checked: previousChecked.get(normName(item.name)) || false
     };
   });
   sortShopping(items);
@@ -1835,7 +2111,7 @@ async function buildShoppingList(renames = new Map()) {
   // antiguo salvo que el destino ya tuviera uno propio (caso merge).
   const previousChecked = new Map();
   [...state.shopping, ...state.spicesShopping].forEach(item => {
-    previousChecked.set(item.name.toLowerCase(), item.checked);
+    previousChecked.set(normName(item.name), item.checked);
   });
   for (const [oldKey, newKey] of renames) {
     if (previousChecked.has(oldKey) && !previousChecked.has(newKey)) {
@@ -1850,8 +2126,8 @@ async function buildShoppingList(renames = new Map()) {
   const pantry = pantrySet();
   const before = ingredients.length + spices.length;
   if (pantry.size > 0) {
-    ingredients = ingredients.filter(it => !pantry.has(it.name.toLowerCase().trim()));
-    spices = spices.filter(it => !pantry.has(it.name.toLowerCase().trim()));
+    ingredients = ingredients.filter(it => !pantry.has(normName(it.name)));
+    spices = spices.filter(it => !pantry.has(normName(it.name)));
   }
   state.pantryHidden = before - (ingredients.length + spices.length);
   state.shopping = ingredients;
@@ -1895,7 +2171,7 @@ function shoppingItemHtml(item) {
         ${sourcesText ? `<span class="shopping-sources">${escapeHtml(sourcesText)}</span>` : ''}
       </div>
       ${item.qty ? `<span class="shopping-qty">${escapeHtml(item.qty)}</span>` : ''}
-      <button type="button" class="shopping-pantry" data-name="${escapeHtml(item.name)}" aria-label="Ya lo tengo en casa" title="Ya lo tengo · mover a la despensa">
+      <button type="button" class="shopping-pantry" data-name="${escapeAttr(item.name)}" aria-label="Ya lo tengo en casa" title="Ya lo tengo · mover a la despensa">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 11l9-8 9 8M5 10v10h14V10"/></svg>
       </button>
       <button type="button" class="shopping-delete" data-id="${item.id}" aria-label="Eliminar de la lista">
@@ -2021,6 +2297,9 @@ async function clearChecks() {
     });
   }
 
+  // Al desmarcar, los items vuelven a su orden alfabético (estaban al final).
+  sortShopping(state.shopping);
+  sortShopping(state.spicesShopping);
   renderShopping();
   showToast('Lista reiniciada');
 }
@@ -2029,7 +2308,7 @@ async function clearChecks() {
 async function addToPantry(name) {
   const clean = (name || '').trim();
   if (!clean) return;
-  const exists = state.pantry.some(p => p.name.toLowerCase() === clean.toLowerCase());
+  const exists = state.pantry.some(p => normName(p.name) === normName(clean));
   if (!exists) {
     const entry = { id: uid(), name: clean };
     state.pantry.push(entry);
@@ -2267,6 +2546,8 @@ function openImport() {
   closeDrawer();
   document.getElementById('recipeUrl').value = '';
   document.getElementById('recipeText').value = '';
+  const aiText = document.getElementById('aiText'); if (aiText) aiText.value = '';
+  const aiImage = document.getElementById('aiImage'); if (aiImage) aiImage.value = '';
   document.getElementById('importBackdrop').classList.add('visible');
   setTimeout(() => document.getElementById('recipeUrl').focus(), 100);
 }
@@ -2304,6 +2585,148 @@ function importRecipeFromText() {
   closeImport();
   openCreateDish(parsed);
   showToast('Receta importada · revísala y guarda');
+}
+
+// ============ CREAR PLATO CON IA (Gemini, BYOK) ============
+// Llama a la API de Gemini desde el navegador con la clave del usuario y pide el
+// plato como JSON estructurado (responseSchema). El resultado se sanea y
+// pre-rellena el modal con openCreateDish(prefill). La clave nunca sale del
+// dispositivo salvo hacia Google. El endpoint admite CORS con la key en query.
+const AI_DISH_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    name: { type: 'STRING' },
+    description: { type: 'STRING' },
+    type: { type: 'STRING', enum: ['comida', 'cena', 'ambos'] },
+    role: { type: 'STRING', enum: ['main', 'starter', 'complete'] },
+    season: { type: 'STRING', enum: ['any', 'invierno', 'verano'] },
+    yields: { type: 'INTEGER' },
+    ingredients: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, qty: { type: 'STRING' } }, required: ['name'] } },
+    spices: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, qty: { type: 'STRING' } }, required: ['name'] } },
+    tags: { type: 'ARRAY', items: { type: 'STRING' } },
+    contains: { type: 'ARRAY', items: { type: 'STRING', enum: ['carne', 'pescado', 'gluten', 'lactosa', 'huevo', 'frutossecos'] } }
+  },
+  required: ['name', 'type', 'role', 'ingredients']
+};
+
+const AI_DISH_PROMPT = `Eres un asistente de cocina. A partir de la descripción o la foto del usuario, devuelve UN solo plato para una app de menús semanales, en español.
+Reglas:
+- "type": "comida", "cena" o "ambos". "role": "main" (principal), "starter" (entrante) o "complete" (plato único).
+- "season": "invierno" o "verano" solo si es claramente de temporada; si no, "any".
+- "ingredients": ingredientes principales con cantidad para 2 raciones (p. ej. "200 g", "2 dientes"). "spices": especias y condimentos aparte.
+- "contains": marca SOLO los presentes entre carne, pescado, gluten, lactosa, huevo, frutossecos.
+- "yields": nº de comidas que rinde (1 normal; 2-4 si es batch cooking).
+Responde únicamente con el JSON conforme al esquema.`;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(',')[1] || '');
+    reader.onerror = () => reject(new Error('No pude leer la imagen'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function callGemini(parts) {
+  if (!state.geminiApiKey) throw new Error('NO_KEY');
+  const model = 'gemini-2.0-flash';
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(state.geminiApiKey)}`;
+  const body = {
+    contents: [{ parts }],
+    generationConfig: { responseMimeType: 'application/json', responseSchema: AI_DISH_SCHEMA, temperature: 0.4 }
+  };
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  if (!res.ok) {
+    let msg = `error ${res.status}`;
+    try { const e = await res.json(); if (e?.error?.message) msg = e.error.message; } catch {}
+    throw new Error(msg);
+  }
+  const data = await res.json();
+  const text = (data?.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim();
+  if (!text) throw new Error('respuesta vacía de la IA');
+  return JSON.parse(text);
+}
+
+// Convierte la respuesta cruda de la IA en un prefill seguro para openCreateDish:
+// valida enums, mapea tags a las disponibles y `contains` a los flags conocidos.
+function sanitizeAiDishToPrefill(raw) {
+  const o = (raw && typeof raw === 'object') ? raw : {};
+  const str = v => typeof v === 'string' ? v.trim() : '';
+  const items = arr => Array.isArray(arr) ? arr
+    .filter(i => i && typeof i.name === 'string' && i.name.trim())
+    .map(i => ({ name: i.name.trim(), qty: i.qty != null ? String(i.qty).trim() : '' })) : [];
+  const lowerMap = new Map(availableTags().map(t => [normName(t), t]));
+  const tags = [...new Set((Array.isArray(o.tags) ? o.tags : [])
+    .map(t => typeof t === 'string' ? lowerMap.get(normName(t)) : null)
+    .filter(Boolean))];
+  const contains = [...new Set((Array.isArray(o.contains) ? o.contains : [])
+    .map(c => {
+      if (typeof c !== 'string') return null;
+      const k = c.toLowerCase().trim();
+      const f = CONTAINS_FLAGS.find(x => x.id === k) || CONTAINS_FLAGS.find(x => x.label.toLowerCase() === k);
+      return f ? f.id : null;
+    })
+    .filter(Boolean))];
+  return {
+    eyebrow: 'Sugerido por IA',
+    name: str(o.name),
+    description: str(o.description),
+    type: ['comida', 'cena', 'ambos'].includes(o.type) ? o.type : 'comida',
+    role: ['main', 'starter', 'complete'].includes(o.role) ? o.role : 'main',
+    season: ['any', 'invierno', 'verano'].includes(o.season) ? o.season : 'any',
+    ingredients: items(o.ingredients),
+    spices: items(o.spices),
+    tags,
+    contains,
+    yields: (typeof o.yields === 'number' && o.yields >= 1) ? Math.min(4, Math.round(o.yields)) : 1
+  };
+}
+
+async function generateDishWithAI() {
+  if (!state.geminiApiKey) {
+    showToast('Configura tu clave de Gemini en Ajustes');
+    closeImport();
+    openDrawer();
+    return;
+  }
+  const text = document.getElementById('aiText').value.trim();
+  const fileInput = document.getElementById('aiImage');
+  const file = fileInput && fileInput.files ? fileInput.files[0] : null;
+  if (!text && !file) { showToast('Escribe algo o adjunta una foto'); return; }
+
+  const btn = document.getElementById('aiGenerateBtn');
+  const prevHtml = btn ? btn.innerHTML : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'Generando…'; }
+  try {
+    const parts = [{ text: AI_DISH_PROMPT + (text ? `\n\nPetición del usuario:\n${text}` : '') }];
+    if (file) {
+      const b64 = await fileToBase64(file);
+      parts.push({ inline_data: { mime_type: file.type || 'image/jpeg', data: b64 } });
+    }
+    const raw = await callGemini(parts);
+    const prefill = sanitizeAiDishToPrefill(raw);
+    if (!prefill.name && prefill.ingredients.length === 0) {
+      showToast('La IA no devolvió un plato válido');
+      return;
+    }
+    closeImport();
+    openCreateDish(prefill);
+    showToast('Plato sugerido por IA · revísalo y guarda');
+  } catch (err) {
+    if (err && err.message === 'NO_KEY') {
+      showToast('Configura tu clave de Gemini en Ajustes');
+      closeImport();
+      openDrawer();
+    } else {
+      showToast('IA: ' + ((err && err.message) || 'error al generar'));
+    }
+  } finally {
+    if (btn) { btn.disabled = false; btn.innerHTML = prevHtml; }
+  }
 }
 
 // ============ EXPORT / IMPORT ============
@@ -2374,7 +2797,8 @@ function normalizeImportedDish(d) {
     spices: Array.isArray(d.spices)
       ? d.spices.filter(s => s && typeof s.name === 'string' && s.name.trim()).map(sanitizeItem)
       : [],
-    createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now()
+    createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now(),
+    archived: typeof d.archived === 'boolean' ? d.archived : false
   };
 }
 
@@ -2465,6 +2889,7 @@ async function importData(file) {
     await loadShowSources();
     await loadRestrictions();
     await loadToggles();
+    await loadGeminiKey();
     await loadPantry();
     await loadHistory();
     applySeasonChip();
@@ -2494,6 +2919,7 @@ async function init() {
     await loadShowSources();
     await loadRestrictions();
     await loadToggles();
+    await loadGeminiKey();
     await loadPantry();
     await loadHistory();
     initTabs();
@@ -2548,6 +2974,14 @@ async function init() {
     });
     document.getElementById('importUrlBtn').addEventListener('click', importRecipeFromUrl);
     document.getElementById('importTextBtn').addEventListener('click', importRecipeFromText);
+    document.getElementById('aiGenerateBtn')?.addEventListener('click', generateDishWithAI);
+
+    // Clave de Gemini (IA)
+    document.getElementById('saveGeminiKey')?.addEventListener('click', saveGeminiKeyFromInput);
+    document.getElementById('clearGeminiKey')?.addEventListener('click', clearGeminiKey);
+    document.getElementById('geminiKey')?.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); saveGeminiKeyFromInput(); }
+    });
 
     // Compartir lista de la compra
     document.getElementById('shareShopping').addEventListener('click', shareShoppingList);
@@ -2561,6 +2995,7 @@ async function init() {
     document.getElementById('generateWeek').addEventListener('click', generateWeek);
     document.getElementById('clearChecks').addEventListener('click', clearChecks);
 
+    document.getElementById('deleteAllDishes')?.addEventListener('click', deleteAllDishes);
     document.getElementById('exportData').addEventListener('click', exportData);
     document.getElementById('importData').addEventListener('click', () => {
       document.getElementById('importFile').click();

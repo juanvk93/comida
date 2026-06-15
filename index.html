@@ -4,6 +4,14 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
   <meta name="theme-color" content="#131313" />
+  <script>
+    // Aplica el tema guardado de forma SÍNCRONA antes de pintar, para evitar el
+    // parpadeo dark→light (el tema "real" vive en IndexedDB y se lee async).
+    try {
+      var t = localStorage.getItem('mimenu-theme');
+      document.documentElement.dataset.theme = (t === 'light' || t === 'dark') ? t : 'dark';
+    } catch (e) { document.documentElement.dataset.theme = 'dark'; }
+  </script>
   <title>MiMenu · Menú Semanal</title>
   <link rel="manifest" href="manifest.json" />
   <link rel="icon" type="image/svg+xml" href="icons/icon.svg" />
@@ -13,7 +21,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="styles.css" />
 </head>
-<body data-theme="dark">
+<body>
 
   <!-- Header -->
   <header class="app-header">
@@ -211,6 +219,18 @@
       </section>
 
       <section class="drawer-section">
+        <h3 class="drawer-label">IA para crear platos (Gemini)</h3>
+        <div class="ingredient-input new-tag-input">
+          <input type="password" id="geminiKey" placeholder="Pega tu clave de Google AI Studio" autocomplete="off" />
+          <button type="button" class="btn-add" id="saveGeminiKey" aria-label="Guardar clave de Gemini">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>
+          </button>
+        </div>
+        <p class="storage-status" id="geminiStatus"></p>
+        <span class="field-hint">Gratis en aistudio.google.com/apikey · se guarda solo en este dispositivo. <button type="button" class="link-btn" id="clearGeminiKey">Borrar clave</button></span>
+      </section>
+
+      <section class="drawer-section">
         <h3 class="drawer-label">Datos</h3>
         <button type="button" class="drawer-action" id="exportData">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12M7 10l5 5 5-5M5 21h14"/></svg>
@@ -222,6 +242,10 @@
         </button>
         <input type="file" id="importFile" accept="application/json,.json" hidden />
         <p class="storage-status" id="storageStatus"></p>
+        <button type="button" class="drawer-action danger" id="deleteAllDishes">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
+          <span>Borrar todos los platos</span>
+        </button>
       </section>
 
       <section class="drawer-section">
@@ -451,6 +475,13 @@
           <span class="field-label">O pega el texto de la receta</span>
           <textarea id="recipeText" rows="6" placeholder="Primera línea: nombre del plato.&#10;Después, un ingrediente por línea:&#10;200 g de pasta&#10;2 dientes de ajo&#10;aceite de oliva"></textarea>
           <button type="button" class="btn-secondary" id="importTextBtn" style="align-self:flex-start;margin-top:8px;">Importar del texto</button>
+        </div>
+        <div class="field ai-field">
+          <span class="field-label">✨ O créalo con IA (Gemini)</span>
+          <textarea id="aiText" rows="3" placeholder="Describe el plato o pega una receta. Ej.: «lentejas con chorizo para 4», «ensalada césar»…"></textarea>
+          <input type="file" id="aiImage" accept="image/*" class="ai-image-input" />
+          <button type="button" class="btn-primary" id="aiGenerateBtn" style="align-self:flex-start;margin-top:8px;">Crear con IA</button>
+          <span class="field-hint">Usa tu clave de Gemini (Ajustes). La foto puede ser del plato o de una receta escrita.</span>
         </div>
       </div>
     </div>
