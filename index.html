@@ -134,6 +134,12 @@
 
       <div class="filters shopping-controls" role="group" aria-label="Opciones de visualización">
         <button type="button" class="chip" id="toggleSources" aria-pressed="false">Mostrar origen ingrediente</button>
+        <div class="diners-control" role="group" aria-label="Comensales">
+          <span class="diners-label">👥 Comensales</span>
+          <button type="button" class="stepper-btn" id="dinersMinus" aria-label="Menos comensales">−</button>
+          <span class="stepper-value" id="dinersValue">2</span>
+          <button type="button" class="stepper-btn" id="dinersPlus" aria-label="Más comensales">+</button>
+        </div>
       </div>
 
       <div class="shopping-meta" id="shoppingMeta"></div>
@@ -207,6 +213,10 @@
           <span class="toggle-text">Tener en cuenta el historial<small>Evita repetir lo de la semana anterior</small></span>
           <span class="toggle-switch" aria-hidden="true"></span>
         </button>
+        <button type="button" class="toggle-row" id="toggleExtendedMeals" role="switch" aria-pressed="false">
+          <span class="toggle-text">Incluir desayuno y merienda<small>Añade esas ingestas a la semana y al plato</small></span>
+          <span class="toggle-switch" aria-hidden="true"></span>
+        </button>
       </section>
 
       <section class="drawer-section">
@@ -239,6 +249,7 @@
           </button>
         </div>
         <p class="storage-status" id="aiStatus"></p>
+        <p class="field-hint" id="aiUsage">Peticiones de IA: <strong id="aiCount">0</strong><span id="aiLast"></span> <button type="button" class="link-btn" id="resetAiCount">Reiniciar contador</button></p>
         <span class="field-hint">La clave se guarda solo en este dispositivo. La IA solo se ejecuta al pulsar sus botones (importar, despensa, semana, etiquetas). <button type="button" class="link-btn" id="clearAiKey">Borrar clave</button></span>
       </section>
 
@@ -258,6 +269,26 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2M6 7l1 13a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-13"/></svg>
           <span>Borrar todos los platos</span>
         </button>
+      </section>
+
+      <section class="drawer-section">
+        <h3 class="drawer-label">Copia en Google Drive</h3>
+        <div class="ingredient-input new-tag-input">
+          <input type="password" id="googleClientId" placeholder="Client ID de Google (…apps.googleusercontent.com)" autocomplete="off" />
+          <button type="button" class="btn-add" id="saveGoogleClientId" aria-label="Guardar Client ID de Google">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M5 12l5 5L20 7"/></svg>
+          </button>
+        </div>
+        <p class="storage-status" id="driveStatus"></p>
+        <button type="button" class="drawer-action" id="driveBackup">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          <span>Hacer copia ahora</span>
+        </button>
+        <button type="button" class="drawer-action" id="driveRestore">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12l7 7 7-7"/></svg>
+          <span>Restaurar desde Drive</span>
+        </button>
+        <span class="field-hint">Tu copia se guarda en una carpeta privada de tu Google Drive (solo esta app la ve). Necesitas un «Client ID» de Google (OAuth, tipo aplicación web). <a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">Crear uno</a></span>
       </section>
 
       <section class="drawer-section">
@@ -362,6 +393,18 @@
         </div>
 
         <div class="field">
+          <span class="field-label">Raciones de la receta</span>
+          <div class="stepper" id="servingsPicker" role="group" aria-label="Raciones de la receta"></div>
+          <span class="field-hint">¿Para cuántas personas son estas cantidades? La compra se ajusta a tus comensales (pestaña Compra).</span>
+        </div>
+
+        <div class="field" id="extraMealsField" hidden>
+          <span class="field-label">Apto para</span>
+          <div class="tag-picker" id="extraMealsPicker" role="group" aria-label="Apto para desayuno o merienda"></div>
+          <span class="field-hint">Marca si este plato sirve como desayuno o merienda (modo activado en Ajustes).</span>
+        </div>
+
+        <div class="field">
           <span class="field-label">Ingredientes <em>*</em></span>
           <div class="ingredient-input">
             <input type="text" id="ingredientName" placeholder="Ingrediente" autocomplete="off" list="ingredientSuggestions" />
@@ -384,6 +427,13 @@
             </button>
           </div>
           <ul class="ingredient-list" id="spiceList"></ul>
+        </div>
+
+        <div class="field">
+          <span class="field-label">Pasos de preparación</span>
+          <textarea id="dishSteps" rows="5" placeholder="Un paso por línea:&#10;1. Cuece la pasta 10 min.&#10;2. Sofríe el ajo…"></textarea>
+          <button type="button" class="btn-secondary ai-suggest-steps" id="aiSuggestSteps" style="align-self:flex-start;margin-top:8px;">✨ Generar pasos con IA</button>
+          <span class="field-hint">Un paso por línea. Los verás al abrir el plato para cocinarlo.</span>
         </div>
 
         <div class="field">

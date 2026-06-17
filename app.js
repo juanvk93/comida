@@ -4,7 +4,7 @@
 
 // ============ INDEXED DB ============
 const DB_NAME = 'mise-db';
-const DB_VERSION = 6;
+const DB_VERSION = 7;
 const STORE_DISHES = 'dishes';
 const STORE_WEEK = 'week';
 const STORE_SHOPPING = 'shopping';
@@ -115,6 +115,24 @@ function openDB() {
           cursor.continue();
         };
       }
+
+      // v6 -> v7: backfill `steps: []` (pasos de preparación),
+      // `servings: 2` (raciones de la receta) y `extraMeals: []` (apto para
+      // desayuno/merienda) en cada plato.
+      if (oldVersion < 7) {
+        const store = upgradeTx.objectStore(STORE_DISHES);
+        store.openCursor().onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (!cursor) return;
+          const dish = cursor.value;
+          let mutated = false;
+          if (!Array.isArray(dish.steps)) { dish.steps = []; mutated = true; }
+          if (typeof dish.servings !== 'number' || dish.servings < 1) { dish.servings = 2; mutated = true; }
+          if (!Array.isArray(dish.extraMeals)) { dish.extraMeals = []; mutated = true; }
+          if (mutated) cursor.update(dish);
+          cursor.continue();
+        };
+      }
     };
   });
 }
@@ -185,6 +203,14 @@ let state = {
   geminiApiKey: '',      // claves BYOK por proveedor (se guardan solo en este dispositivo)
   claudeApiKey: '',
   openaiApiKey: '',
+  aiRequestCount: 0,     // nº total de peticiones enviadas a la IA (auditoría)
+  aiLastRequestAt: null, // timestamp (ms) de la última petición a la IA
+  diners: 2,             // comensales en casa: escala las cantidades de la compra
+  extendedMeals: false,  // modo desayuno/merienda (opt-in); off = solo comida/cena
+  googleClientId: '',    // OAuth Client ID de Google (BYO) para backup en Drive
+  driveSyncedAt: null,   // timestamp (ms) del último backup/restauración en Drive
+  modalServings: 2,      // raciones de la receta en edición
+  modalExtraMeals: [],   // ['desayuno','merienda'] del plato en edición
   drag: null             // estado transitorio del drag & drop en la semana
 };
 
@@ -201,7 +227,7 @@ const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', '
 
 const BUILTIN_TAGS = ['pasta', 'arroz', 'legumbre', 'pescado', 'carne', 'ave', 'huevo', 'verdura', 'sopa', 'ensalada'];
 
-const APP_VERSION = '1.7.0';
+const APP_VERSION = '1.8.0';
 
 // Paleta curada de acentos. `indigo` (por defecto) no define vars: deja que el
 // CSS aplique los valores afinados por tema (dark/light) de :root. El resto
@@ -228,6 +254,18 @@ const ACCENTS = {
 
 // Historial de cambios. El primero es el más reciente y se marca como "actual".
 const CHANGELOG = [
+  { version: '1.8.0', date: 'Junio 2026', items: [
+    'Pasos de preparación en cada plato, con botón para generarlos con IA.',
+    'Comensales: ajusta cuántos sois y la lista de la compra escala las cantidades.',
+    'La lista de la compra se agrupa por secciones del súper (frutería, carnicería…).',
+    'Modo desayuno y merienda (opcional, en Ajustes › Generación): añade esas ingestas a la semana.',
+    'Copia de seguridad en tu Google Drive: haz copia y restaura desde cualquier dispositivo.'
+  ]},
+  { version: '1.7.1', date: 'Junio 2026', items: [
+    'Gemini usa ahora gemini-2.5-flash (más cuota gratuita).',
+    'Reintentos automáticos con espera progresiva si la IA devuelve «demasiadas peticiones» (429).',
+    'Contador de peticiones de IA en Ajustes › IA, para auditar el uso (la IA solo se ejecuta al pulsar sus botones).'
+  ]},
   { version: '1.7.0', date: 'Junio 2026', items: [
     'Archivar platos: ocúltalos del recetario y de la generación sin borrarlos (chip «Archivados»).',
     'Sugerir la semana entera con IA a partir de tu recetario, buscando variedad.',
@@ -483,6 +521,32 @@ async function loadShowSources() {
   state.showSources = setting?.value === true;
 }
 
+// Comensales en casa (1–12): escala las cantidades de la lista de la compra.
+async function loadDiners() {
+  const setting = await idb.get(STORE_SETTINGS, 'diners');
+  const n = setting?.value;
+  state.diners = (typeof n === 'number' && n >= 1) ? Math.min(12, Math.round(n)) : 2;
+}
+
+function renderDinersControl() {
+  const el = document.getElementById('dinersValue');
+  if (el) el.textContent = String(state.diners);
+}
+
+async function setDiners(n) {
+  const next = Math.max(1, Math.min(12, n));
+  if (next === state.diners) return;
+  state.diners = next;
+  await idb.put(STORE_SETTINGS, { key: 'diners', value: state.diners });
+  renderDinersControl();
+  await buildShoppingList();   // recalcula la compra con el nuevo factor
+}
+
+function initDinersControl() {
+  document.getElementById('dinersMinus')?.addEventListener('click', () => setDiners(state.diners - 1));
+  document.getElementById('dinersPlus')?.addEventListener('click', () => setDiners(state.diners + 1));
+}
+
 async function loadRestrictions() {
   const setting = await idb.get(STORE_SETTINGS, 'restrictions');
   const valid = new Set(RESTRICTIONS.map(r => r.id));
@@ -496,6 +560,30 @@ async function loadToggles() {
   const h = await idb.get(STORE_SETTINGS, 'useHistory');
   state.useRatings = r?.value !== false;   // default true
   state.useHistory = h?.value !== false;   // default true
+}
+
+// Modo desayuno/merienda (opt-in, default false).
+async function loadExtendedMeals() {
+  const setting = await idb.get(STORE_SETTINGS, 'extendedMeals');
+  state.extendedMeals = setting?.value === true;
+}
+
+function applyExtendedMealsToggle() {
+  const b = document.getElementById('toggleExtendedMeals');
+  if (b) { b.classList.toggle('active', state.extendedMeals); b.setAttribute('aria-pressed', String(state.extendedMeals)); }
+}
+
+function initExtendedMealsToggle() {
+  const b = document.getElementById('toggleExtendedMeals');
+  if (!b) return;
+  b.addEventListener('click', async () => {
+    state.extendedMeals = !state.extendedMeals;
+    applyExtendedMealsToggle();
+    await idb.put(STORE_SETTINGS, { key: 'extendedMeals', value: state.extendedMeals });
+    renderWeek();
+    updateModalExtraMealsVisibility();
+    await buildShoppingList();   // desayuno/merienda entran o salen de la compra
+  });
 }
 
 async function loadPantry() {
@@ -516,7 +604,7 @@ function computeRecentDishIds() {
   const last = state.history[0];
   if (!last || !Array.isArray(last.data)) return;
   last.data.forEach(day => {
-    ['lunch', 'lunchStarter', 'dinner'].forEach(slot => {
+    SLOT_FIELDS.forEach(slot => {
       if (day[slot]) state.recentDishIds.add(day[slot]);
     });
   });
@@ -636,6 +724,7 @@ function openDrawer() {
   document.getElementById('menuToggle').setAttribute('aria-expanded', 'true');
   updateStorageStatus();
   renderAiSettings();
+  updateDriveStatus();
 }
 
 function closeDrawer() {
@@ -694,7 +783,7 @@ function initToggles() {
 // proveedor). TODA función de IA se dispara con un botón EXPLÍCITO (importar,
 // despensa, semana, etiquetas), nunca en automático: no hay llamadas continuas.
 const AI_PROVIDERS = {
-  gemini: { name: 'Gemini', keySetting: 'geminiApiKey', model: 'gemini-2.0-flash', help: 'Gratis en aistudio.google.com/apikey' },
+  gemini: { name: 'Gemini', keySetting: 'geminiApiKey', model: 'gemini-2.5-flash', help: 'Gratis en aistudio.google.com/apikey' },
   claude: { name: 'Claude', keySetting: 'claudeApiKey', model: 'claude-haiku-4-5', help: 'console.anthropic.com (modelo Haiku, muy barato)' },
   openai: { name: 'ChatGPT', keySetting: 'openaiApiKey', model: 'gpt-4o-mini', help: 'platform.openai.com/api-keys (modelo mini, barato)' }
 };
@@ -706,6 +795,10 @@ async function loadAiSettings() {
     const s = await idb.get(STORE_SETTINGS, def.keySetting);
     state[def.keySetting] = typeof s?.value === 'string' ? s.value : '';
   }
+  const c = await idb.get(STORE_SETTINGS, 'aiRequestCount');
+  state.aiRequestCount = Number.isFinite(c?.value) ? c.value : 0;
+  const l = await idb.get(STORE_SETTINGS, 'aiLastRequestAt');
+  state.aiLastRequestAt = typeof l?.value === 'number' ? l.value : null;
 }
 
 function activeProvider() { return AI_PROVIDERS[state.aiProvider] || AI_PROVIDERS.gemini; }
@@ -727,6 +820,27 @@ function renderAiSettings() {
   const input = document.getElementById('aiKey');
   if (input) { input.value = ''; input.placeholder = `Clave de ${activeProvider().name}`; }
   updateAiStatus();
+  updateAiUsage();
+}
+
+// Refleja el contador de auditoría en el drawer (nº de peticiones y última hora).
+function updateAiUsage() {
+  const c = document.getElementById('aiCount');
+  if (c) c.textContent = String(state.aiRequestCount || 0);
+  const l = document.getElementById('aiLast');
+  if (l) l.textContent = state.aiLastRequestAt
+    ? ` · última: ${new Date(state.aiLastRequestAt).toLocaleString('es')}`
+    : '';
+}
+
+// Pone a cero el contador de peticiones de IA (no afecta a las claves).
+async function resetAiCount() {
+  state.aiRequestCount = 0;
+  state.aiLastRequestAt = null;
+  await idb.put(STORE_SETTINGS, { key: 'aiRequestCount', value: 0 });
+  await idb.put(STORE_SETTINGS, { key: 'aiLastRequestAt', value: null });
+  updateAiUsage();
+  showToast('Contador de IA reiniciado');
 }
 
 async function saveAiKeyFromInput() {
@@ -851,6 +965,9 @@ async function loadDishes() {
     if (typeof d.rating !== 'number') d.rating = 0;
     if (typeof d.yields !== 'number' || d.yields < 1) d.yields = 1;
     if (typeof d.archived !== 'boolean') d.archived = false;
+    if (!Array.isArray(d.steps)) d.steps = [];
+    if (typeof d.servings !== 'number' || d.servings < 1) d.servings = 2;
+    if (!Array.isArray(d.extraMeals)) d.extraMeals = [];
   });
   state.dishes.sort((a, b) => a.name.localeCompare(b.name, 'es', { sensitivity: 'base' }));
   renderDishes();
@@ -919,15 +1036,20 @@ function renderDishes() {
     const f = CONTAINS_FLAGS.find(x => x.id === id);
     return f ? `<span class="dish-diet">${escapeHtml(f.label)}</span>` : '';
   };
+  // Badge de estación: solo si el plato es de verano o invierno ('any' no se muestra).
+  const seasonBadge = (s) => {
+    const label = s === 'verano' ? '☀️ Verano' : s === 'invierno' ? '❄️ Invierno' : '';
+    return label ? `<span class="dish-season season-${s}">${label}</span>` : '';
+  };
 
   grid.innerHTML = filtered.map(dish => {
     const typeLabel = dish.type === 'ambos' ? 'Comida · Cena' : (dish.type.charAt(0).toUpperCase() + dish.type.slice(1));
-    const allIngredients = Array.isArray(dish.ingredients) ? dish.ingredients : [];
-    const ingredients = allIngredients.slice(0, 4);
-    const more = allIngredients.length - 4;
     const tags = Array.isArray(dish.tags) ? dish.tags : [];
     const contains = Array.isArray(dish.contains) ? dish.contains : [];
     const yields = dish.yields || 1;
+    const season = seasonBadge(dish.season || 'any');
+    const hasSteps = Array.isArray(dish.steps) && dish.steps.length > 0;
+    const recipeBadge = hasSteps ? `<span class="dish-recipe" title="Tiene pasos de preparación">📋 receta</span>` : '';
     return `
       <article class="dish-card" data-id="${dish.id}">
         <div class="dish-card-top">
@@ -936,15 +1058,13 @@ function renderDishes() {
         </div>
         <h3 class="dish-name">${escapeHtml(dish.name)}</h3>
         ${dish.description ? `<p class="dish-desc">${escapeHtml(dish.description)}</p>` : ''}
-        ${(tags.length || contains.length || yields > 1) ? `<div class="dish-tags">
+        ${(season || recipeBadge || tags.length || contains.length || yields > 1) ? `<div class="dish-tags">
+          ${season}
+          ${recipeBadge}
           ${tags.map(t => `<span class="dish-tag">${escapeHtml(t)}</span>`).join('')}
           ${yields > 1 ? `<span class="dish-yields">♻ rinde ${yields}</span>` : ''}
           ${contains.map(dietBadge).join('')}
         </div>` : ''}
-        <div class="dish-ingredients">
-          ${ingredients.map(i => `<span class="dish-ingredient-tag">${escapeHtml(i.name)}</span>`).join('')}
-          ${more > 0 ? `<span class="dish-ingredient-more">+${more}</span>` : ''}
-        </div>
       </article>
     `;
   }).join('');
@@ -1062,11 +1182,14 @@ function openCreateDish(prefill = null) {
   state.modalContains = Array.isArray(prefill?.contains) ? [...prefill.contains] : [];
   state.modalRating = 0;
   state.modalYields = (typeof prefill?.yields === 'number' && prefill.yields >= 1) ? Math.min(4, prefill.yields) : 1;
+  state.modalServings = (typeof prefill?.servings === 'number' && prefill.servings >= 1) ? Math.min(12, Math.round(prefill.servings)) : 2;
+  state.modalExtraMeals = Array.isArray(prefill?.extraMeals) ? prefill.extraMeals.filter(m => m === 'desayuno' || m === 'merienda') : [];
   document.getElementById('modalEyebrow').textContent = prefill ? (prefill.eyebrow || 'Receta importada') : '';
   document.getElementById('modalTitle').textContent = prefill?.name ? prefill.name : 'Nuevo plato';
   document.getElementById('dishId').value = '';
   document.getElementById('dishName').value = prefill?.name || '';
   document.getElementById('dishDescription').value = prefill?.description || '';
+  document.getElementById('dishSteps').value = Array.isArray(prefill?.steps) ? prefill.steps.join('\n') : '';
   // Marca el radio del valor pedido; si no es válido, cae al valor por defecto.
   const setRadio = (name, value, fallback) => {
     const el = document.querySelector(`input[name="${name}"][value="${value}"]`)
@@ -1086,6 +1209,9 @@ function openCreateDish(prefill = null) {
   renderModalContains();
   renderModalRating();
   renderModalYields();
+  renderModalServings();
+  renderModalExtraMeals();
+  updateModalExtraMealsVisibility();
   showModal();
 }
 
@@ -1107,11 +1233,14 @@ function openEditDish(id) {
   state.modalContains = Array.isArray(dish.contains) ? [...dish.contains] : [];
   state.modalRating = typeof dish.rating === 'number' ? dish.rating : 0;
   state.modalYields = typeof dish.yields === 'number' && dish.yields >= 1 ? dish.yields : 1;
+  state.modalServings = typeof dish.servings === 'number' && dish.servings >= 1 ? dish.servings : 2;
+  state.modalExtraMeals = Array.isArray(dish.extraMeals) ? [...dish.extraMeals] : [];
   document.getElementById('modalEyebrow').textContent = 'Editando';
   document.getElementById('modalTitle').textContent = dish.name;
   document.getElementById('dishId').value = id;
   document.getElementById('dishName').value = dish.name;
   document.getElementById('dishDescription').value = dish.description || '';
+  document.getElementById('dishSteps').value = Array.isArray(dish.steps) ? dish.steps.join('\n') : '';
   document.querySelector(`input[name="dishType"][value="${dish.type}"]`).checked = true;
   const role = dish.role || 'main';
   document.querySelector(`input[name="dishRole"][value="${role}"]`).checked = true;
@@ -1127,6 +1256,9 @@ function openEditDish(id) {
   renderModalContains();
   renderModalRating();
   renderModalYields();
+  renderModalServings();
+  renderModalExtraMeals();
+  updateModalExtraMealsVisibility();
   showModal();
 }
 
@@ -1182,6 +1314,49 @@ function renderModalYields() {
       renderModalYields();
     });
   });
+}
+
+// Raciones de la receta (para cuántas personas son las cantidades). La compra se
+// reescala luego según los comensales de casa (state.diners).
+function renderModalServings() {
+  const container = document.getElementById('servingsPicker');
+  if (!container) return;
+  const v = state.modalServings;
+  container.innerHTML = `
+    <button type="button" class="stepper-btn" data-delta="-1" aria-label="Menos raciones">−</button>
+    <span class="stepper-value">${v} ${v === 1 ? 'ración' : 'raciones'}</span>
+    <button type="button" class="stepper-btn" data-delta="1" aria-label="Más raciones">+</button>`;
+  container.querySelectorAll('[data-delta]').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const next = state.modalServings + parseInt(btn.dataset.delta);
+      state.modalServings = Math.max(1, Math.min(12, next));
+      renderModalServings();
+    });
+  });
+}
+
+// Picker «Apto para» (desayuno/merienda). Solo se muestra con el modo extendido.
+function renderModalExtraMeals() {
+  const container = document.getElementById('extraMealsPicker');
+  if (!container) return;
+  const opts = [{ id: 'desayuno', label: 'Desayuno' }, { id: 'merienda', label: 'Merienda' }];
+  container.innerHTML = opts.map(o => {
+    const active = state.modalExtraMeals.includes(o.id);
+    return `<button type="button" class="tag-chip ${active ? 'active' : ''}" data-meal="${o.id}" aria-pressed="${active}">${o.label}</button>`;
+  }).join('');
+  container.querySelectorAll('.tag-chip').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const id = btn.dataset.meal;
+      const i = state.modalExtraMeals.indexOf(id);
+      if (i >= 0) state.modalExtraMeals.splice(i, 1); else state.modalExtraMeals.push(id);
+      renderModalExtraMeals();
+    });
+  });
+}
+
+function updateModalExtraMealsVisibility() {
+  const field = document.getElementById('extraMealsField');
+  if (field) field.hidden = !state.extendedMeals;
 }
 
 function showModal() {
@@ -1344,6 +1519,9 @@ async function saveDish(e) {
   if (!name) { showToast('Falta el nombre del plato'); return; }
   if (state.modalIngredients.length === 0) { showToast('Añade al menos un ingrediente'); return; }
 
+  const steps = document.getElementById('dishSteps').value
+    .split('\n').map(s => s.trim()).filter(Boolean);
+
   const dish = {
     id: state.editingDish || uid(),
     name,
@@ -1355,6 +1533,9 @@ async function saveDish(e) {
     contains: [...state.modalContains],
     rating: state.modalRating,
     yields: state.modalYields,
+    servings: state.modalServings,
+    extraMeals: [...state.modalExtraMeals],
+    steps,
     ingredients: state.modalIngredients,
     spices: state.modalSpices,
     createdAt: state.editingDish
@@ -1391,7 +1572,7 @@ async function saveDish(e) {
 
   // Si el plato está en la semana actual, la lista de la compra puede haber
   // quedado desfasada (rename, ingrediente añadido/eliminado). Recalcularla.
-  const inCurrentWeek = state.week && state.week.some(d => d.lunch === dish.id || d.lunchStarter === dish.id || d.dinner === dish.id);
+  const inCurrentWeek = state.week && state.week.some(d => SLOT_FIELDS.some(s => d[s] === dish.id));
   if (inCurrentWeek) {
     await buildShoppingList(renames);
     renderWeek();
@@ -1445,19 +1626,17 @@ async function toggleArchiveDish() {
 // generar) y `leftover` (sobras de batch, no cuenta para la compra).
 function emptyDay() {
   return {
-    lunch: null, lunchStarter: null, dinner: null,
-    locked: { lunch: false, lunchStarter: false, dinner: false },
-    leftover: { lunch: false, lunchStarter: false, dinner: false }
+    breakfast: null, lunch: null, lunchStarter: null, dinner: null, snack: null,
+    locked: { breakfast: false, lunch: false, lunchStarter: false, dinner: false, snack: false },
+    leftover: { breakfast: false, lunch: false, lunchStarter: false, dinner: false, snack: false }
   };
 }
 
 function normalizeDay(day) {
   const d = emptyDay();
   if (!day) return d;
-  d.lunch = day.lunch || null;
-  d.lunchStarter = day.lunchStarter || null;
-  d.dinner = day.dinner || null;
   for (const s of SLOT_FIELDS) {
+    d[s] = day[s] || null;
     if (day.locked) d.locked[s] = !!day.locked[s];
     if (day.leftover) d.leftover[s] = !!day.leftover[s];
   }
@@ -1531,22 +1710,30 @@ function renderWeek() {
   };
 
   grid.innerHTML = state.week.map((day, idx) => {
-    const lunchDish = day.lunch ? state.dishes.find(d => d.id === day.lunch) : null;
-    const starterDish = day.lunchStarter ? state.dishes.find(d => d.id === day.lunchStarter) : null;
-    const dinnerDish = day.dinner ? state.dishes.find(d => d.id === day.dinner) : null;
+    const dishFor = (slot) => day[slot] ? state.dishes.find(d => d.id === day[slot]) : null;
+    const lunchDish = dishFor('lunch');
+    const starterDish = dishFor('lunchStarter');
     const isWeekend = idx >= 5;
     const L = day.locked, LO = day.leftover;
+    const lineCls = (meal) => `meal-line${L[meal] ? ' is-locked' : ''}`;
+
+    // Slot de una sola línea (desayuno, merienda, cena): sin entrante.
+    const simpleSlot = (label, meal, slotCls) => {
+      const dish = dishFor(meal);
+      const low = label.toLowerCase();
+      return `
+        <div class="meal-slot ${slotCls}" data-day="${idx}">
+          <span class="meal-label">${label}</span>
+          <div class="${lineCls(meal)}" data-day="${idx}" data-meal="${meal}">
+            ${nameSpan('meal-dish', idx, meal, dish, LO[meal], L[meal], 'Sin asignar')}
+            ${actions(idx, meal, !!dish, L[meal], LO[meal], { del: 'Eliminar ' + low, reroll: 'Cambiar ' + low })}
+          </div>
+        </div>`;
+    };
 
     // Línea de entrante si hay entrante o si el principal lo admite (no complete).
     const showStarterLine = !!day.lunchStarter || (lunchDish && lunchDish.role !== 'complete');
-    const lineCls = (meal) => `meal-line${L[meal] ? ' is-locked' : ''}`;
-
-    return `
-      <article class="day-card${isWeekend ? ' is-weekend' : ''}" data-day="${idx}">
-        <div class="day-header">
-          <h3 class="day-name">${DAYS[idx]}</h3>
-          <button type="button" class="day-drag-handle" data-day="${idx}" aria-label="Mover ${DAYS[idx]} (arrastrar para reordenar)" title="Arrastra para reordenar este día">${DAY_DRAG_SVG}</button>
-        </div>
+    const lunchSlot = `
         <div class="meal-slot lunch-slot" data-day="${idx}">
           <span class="meal-label">Comida</span>
           ${showStarterLine ? `
@@ -1559,14 +1746,18 @@ function renderWeek() {
             ${nameSpan('meal-dish', idx, 'lunch', lunchDish, LO.lunch, L.lunch, 'Sin asignar')}
             ${actions(idx, 'lunch', !!lunchDish, L.lunch, LO.lunch, { del: 'Eliminar comida', reroll: 'Cambiar comida' })}
           </div>
+        </div>`;
+
+    return `
+      <article class="day-card${isWeekend ? ' is-weekend' : ''}" data-day="${idx}">
+        <div class="day-header">
+          <h3 class="day-name">${DAYS[idx]}</h3>
+          <button type="button" class="day-drag-handle" data-day="${idx}" aria-label="Mover ${DAYS[idx]} (arrastrar para reordenar)" title="Arrastra para reordenar este día">${DAY_DRAG_SVG}</button>
         </div>
-        <div class="meal-slot dinner-slot" data-day="${idx}">
-          <span class="meal-label">Cena</span>
-          <div class="${lineCls('dinner')}" data-day="${idx}" data-meal="dinner">
-            ${nameSpan('meal-dish', idx, 'dinner', dinnerDish, LO.dinner, L.dinner, 'Sin asignar')}
-            ${actions(idx, 'dinner', !!dinnerDish, L.dinner, LO.dinner, { del: 'Eliminar cena', reroll: 'Cambiar cena' })}
-          </div>
-        </div>
+        ${state.extendedMeals ? simpleSlot('Desayuno', 'breakfast', 'breakfast-slot') : ''}
+        ${lunchSlot}
+        ${state.extendedMeals ? simpleSlot('Merienda', 'snack', 'snack-slot') : ''}
+        ${simpleSlot('Cena', 'dinner', 'dinner-slot')}
       </article>
     `;
   }).join('');
@@ -1618,7 +1809,7 @@ async function deleteMeal(dayIdx, meal) {
   day[meal] = null;
   day.locked[meal] = false;
   day.leftover[meal] = false;
-  if ((meal === 'lunch' || meal === 'dinner') && freshLead) {
+  if (MAIN_SLOTS.includes(meal) && freshLead) {
     clearTrailingLeftovers(dayIdx, meal, freshLead);
   }
   await persistWeek();
@@ -1707,6 +1898,8 @@ function dishFitsSlot(dish, meal) {
   if (meal === 'lunchStarter') return (dish.type === 'comida' || dish.type === 'ambos') && dish.role === 'starter';
   if (meal === 'lunch') return (dish.type === 'comida' || dish.type === 'ambos') && dish.role !== 'starter';
   if (meal === 'dinner') return (dish.type === 'cena' || dish.type === 'ambos') && dish.role !== 'starter';
+  if (meal === 'breakfast') return (dish.extraMeals || []).includes('desayuno');
+  if (meal === 'snack') return (dish.extraMeals || []).includes('merienda');
   return true;
 }
 
@@ -1720,8 +1913,8 @@ async function moveDish(fromDay, fromMeal, toDay, toMeal) {
   if (!dishFitsSlot(bDish, fromMeal)) { showToast(`"${bDish?.name}" no encaja ahí`); return; }
 
   // Mover rompe los lazos de batch: limpiamos las sobras de los leads movidos.
-  if ((fromMeal === 'lunch' || fromMeal === 'dinner') && aId && !a.leftover[fromMeal]) clearTrailingLeftovers(fromDay, fromMeal, aId);
-  if ((toMeal === 'lunch' || toMeal === 'dinner') && bId && !b.leftover[toMeal]) clearTrailingLeftovers(toDay, toMeal, bId);
+  if (MAIN_SLOTS.includes(fromMeal) && aId && !a.leftover[fromMeal]) clearTrailingLeftovers(fromDay, fromMeal, aId);
+  if (MAIN_SLOTS.includes(toMeal) && bId && !b.leftover[toMeal]) clearTrailingLeftovers(toDay, toMeal, bId);
 
   a[fromMeal] = bId; a.leftover[fromMeal] = false;
   b[toMeal] = aId;   b.leftover[toMeal] = false;
@@ -1817,7 +2010,7 @@ async function onDayDragEnd(e) {
 // anterior ya no cocina el mismo plato), p. ej. tras reordenar días. Así la
 // compra vuelve a contar ese plato y no quedan sobras sin su lead.
 function repairLeftovers() {
-  for (const meal of ['lunch', 'dinner']) {
+  for (const meal of MAIN_SLOTS) {
     for (let d = 0; d < state.week.length; d++) {
       if (!state.week[d].leftover[meal]) continue;
       const id = state.week[d][meal];
@@ -1846,14 +2039,27 @@ async function swapDays(fromIdx, toIdx) {
 // cena(d) ↔ entrante/comida(d+1).
 function isAdjacentSlot(aDay, aMeal, bDay, bMeal) {
   if (aDay === bDay) return aMeal !== bMeal;
-  const isDinner = m => m === 'dinner';
-  const isLunchish = m => m === 'lunch' || m === 'lunchStarter';
-  if (aDay === bDay - 1 && isDinner(aMeal) && isLunchish(bMeal)) return true;
-  if (aDay === bDay + 1 && isLunchish(aMeal) && isDinner(bMeal)) return true;
+  const isLast = m => m === 'dinner';                                   // última ingesta del día
+  const isFirst = m => m === 'breakfast' || m === 'lunch' || m === 'lunchStarter'; // primeras del día
+  if (aDay === bDay - 1 && isLast(aMeal) && isFirst(bMeal)) return true;
+  if (aDay === bDay + 1 && isFirst(aMeal) && isLast(bMeal)) return true;
   return false;
 }
 
-const SLOT_FIELDS = ['lunch', 'lunchStarter', 'dinner'];
+// Todos los slots de un día, en orden cronológico. breakfast/snack solo se
+// generan y muestran con el modo extendido (state.extendedMeals); en modo normal
+// quedan a null y se ignoran. lunchStarter es el entrante de la comida.
+const SLOT_FIELDS = ['breakfast', 'lunch', 'lunchStarter', 'dinner', 'snack'];
+// Carriles "principales" (admiten batch cooking / sobras). El entrante no.
+const MAIN_SLOTS = ['breakfast', 'lunch', 'dinner', 'snack'];
+
+// Slots que cuentan según el modo activo: en modo normal, solo comida/entrante/
+// cena; con el modo extendido, también desayuno y merienda. Si se desactiva el
+// modo, los platos de desayuno/merienda quedan guardados pero no se renderizan
+// ni entran en la compra (vuelven al reactivarlo).
+function activeSlots() {
+  return state.extendedMeals ? SLOT_FIELDS : ['lunch', 'lunchStarter', 'dinner'];
+}
 
 // Devuelve un peso > 0 indicando lo deseable que es poner `dish` en (slotDay, slotMeal),
 // dado el contenido actual de `week`. Los slots vacíos se ignoran.
@@ -1954,6 +2160,13 @@ function dinnerPool() {
     && eligible(d)
   );
 }
+// Pools del modo extendido: aptos para desayuno / merienda (campo extraMeals).
+function breakfastPool() {
+  return state.dishes.filter(d => (d.extraMeals || []).includes('desayuno') && eligible(d));
+}
+function snackPool() {
+  return state.dishes.filter(d => (d.extraMeals || []).includes('merienda') && eligible(d));
+}
 
 // Devuelve el id de un entrante adecuado para acompañar al main dado, o null
 // si no procede (main es 'complete', o no hay entrantes disponibles).
@@ -1997,11 +2210,15 @@ function ensureStarter(week, i) {
 // antiguas. Solo si el historial está activo.
 async function archiveCurrentWeek() {
   if (!state.useHistory || !state.week) return;
-  const hasContent = state.week.some(day => day.lunch || day.lunchStarter || day.dinner);
+  const hasContent = state.week.some(day => SLOT_FIELDS.some(s => day[s]));
   if (!hasContent) return;
   const snapshot = {
     id: uid(),
-    data: state.week.map(d => ({ lunch: d.lunch, lunchStarter: d.lunchStarter, dinner: d.dinner })),
+    data: state.week.map(d => {
+      const o = {};
+      SLOT_FIELDS.forEach(s => { o[s] = d[s]; });
+      return o;
+    }),
     generatedAt: state.weekGeneratedAt || Date.now(),
     archivedAt: Date.now()
   };
@@ -2014,6 +2231,8 @@ async function generateWeek() {
   await loadDishes();
   const lunches = lunchMainPool();
   const dinners = dinnerPool();
+  const breakfasts = state.extendedMeals ? breakfastPool() : [];
+  const snacks = state.extendedMeals ? snackPool() : [];
 
   if (lunches.length === 0) { showToast('Necesitas un plato de comida (revisa restricciones/estación)'); return; }
   if (dinners.length === 0) { showToast('Necesitas un plato de cena (revisa restricciones/estación)'); return; }
@@ -2039,11 +2258,19 @@ async function generateWeek() {
   });
 
   for (let i = 0; i < 7; i++) {
+    if (state.extendedMeals && !week[i].breakfast && breakfasts.length) {
+      const pick = weightedPick(breakfasts, d => scoreDish(d, week, i, 'breakfast'));
+      if (pick) { week[i].breakfast = pick.id; placeLeftovers(week, i, 'breakfast', pick); }
+    }
     if (!week[i].lunch) {
       const pick = weightedPick(lunches, d => scoreDish(d, week, i, 'lunch'));
       if (pick) { week[i].lunch = pick.id; placeLeftovers(week, i, 'lunch', pick); }
     }
     ensureStarter(week, i);
+    if (state.extendedMeals && !week[i].snack && snacks.length) {
+      const pick = weightedPick(snacks, d => scoreDish(d, week, i, 'snack'));
+      if (pick) { week[i].snack = pick.id; placeLeftovers(week, i, 'snack', pick); }
+    }
     if (!week[i].dinner) {
       const pick = weightedPick(dinners, d => scoreDish(d, week, i, 'dinner'));
       if (pick) { week[i].dinner = pick.id; placeLeftovers(week, i, 'dinner', pick); }
@@ -2065,12 +2292,14 @@ async function rerollMeal(dayIdx, meal) {
   let pool;
   if (meal === 'lunch') pool = lunchMainPool();
   else if (meal === 'lunchStarter') pool = lunchStarterPool();
+  else if (meal === 'breakfast') pool = breakfastPool();
+  else if (meal === 'snack') pool = snackPool();
   else pool = dinnerPool();
   if (pool.length === 0) { showToast('No hay platos disponibles para este hueco'); return; }
 
   const previous = day[meal];
   // Reroll manual = un solo slot. Si era lead de un batch, soltamos sus sobras.
-  if ((meal === 'lunch' || meal === 'dinner') && previous && !day.leftover[meal]) {
+  if (MAIN_SLOTS.includes(meal) && previous && !day.leftover[meal]) {
     clearTrailingLeftovers(dayIdx, meal, previous);
   }
   day[meal] = null;
@@ -2090,6 +2319,47 @@ async function rerollMeal(dayIdx, meal) {
 }
 
 // ============ SHOPPING LIST ============
+// Secciones del súper en orden de recorrido típico. Cada ingrediente se clasifica
+// por palabras clave; lo no reconocido cae en «Otros». El orden de esta lista es
+// el orden en que se pintan las secciones (y gana la primera que haga match).
+const SHOPPING_CATEGORIES = [
+  { id: 'verduras', label: 'Frutas y verduras', icon: '🥬', keywords: ['tomate','lechuga','cebolla','ajo','patata','zanahoria','pimiento','calabacin','berenjena','pepino','espinaca','acelga','brocoli','coliflor','champiñon','seta','judia','guisante','apio','puerro','calabaza','rucula','canonigos','escarola','col','repollo','remolacha','rabano','nabo','alcachofa','esparrago','aguacate','manzana','platano','banana','naranja','limon','lima','pera','fresa','uva','melon','sandia','kiwi','mango','piña','melocoton','albaricoque','ciruela','cereza','frambuesa','arandano','mandarina','pomelo','higo','datil','fruta','verdura','hortaliza','jengibre','perejil','cilantro','albahaca','menta','hierbabuena'] },
+  { id: 'carne', label: 'Carnicería', icon: '🥩', keywords: ['pollo','pechuga','muslo','ternera','cerdo','cordero','carne','solomillo','lomo','costilla','chuleta','filete','hamburguesa','salchicha','bacon','panceta','chorizo','morcilla','conejo','pavo','jamon','higado','albondiga','picada'] },
+  { id: 'pescado', label: 'Pescadería', icon: '🐟', keywords: ['pescado','salmon','merluza','atun','bacalao','dorada','lubina','sardina','boqueron','trucha','gamba','langostino','marisco','mejillon','almeja','calamar','pulpo','sepia','rape','lenguado','caballa','anchoa','vieira','navaja','berberecho'] },
+  { id: 'lacteos', label: 'Lácteos y huevos', icon: '🥚', keywords: ['leche','huevo','queso','yogur','mantequilla','nata','crema','requeson','cuajada','kefir','mozzarella','parmesano','feta','mascarpone','bechamel'] },
+  { id: 'panaderia', label: 'Panadería', icon: '🍞', keywords: ['pan','barra','baguette','molde','wrap','tortita','tostada','biscote','picos','colines','bolleria','croissant','magdalena','bizcocho'] },
+  { id: 'despensa', label: 'Despensa', icon: '🥫', keywords: ['pasta','espagueti','macarron','arroz','fideo','lenteja','garbanzo','alubia','frijol','harina','azucar','aceite','vinagre','sal','conserva','lata','maiz','aceituna','caldo','pastilla','salsa','soja','miel','mermelada','cacao','chocolate','cafe','te','infusion','galleta','cereal','avena','quinoa','cuscus','polenta','levadura','gelatina','nuez','almendra','pasa','cacahuete','pipa','coco','sesamo'] },
+  { id: 'congelados', label: 'Congelados', icon: '🧊', keywords: ['congelado','helado'] },
+  { id: 'bebidas', label: 'Bebidas', icon: '🧃', keywords: ['agua','refresco','zumo','vino','cerveza','bebida','gaseosa','tonica'] },
+  { id: 'otros', label: 'Otros', icon: '🛒', keywords: [] }
+];
+
+function stripAccents(s) {
+  return String(s == null ? '' : s).normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
+// Clasifica un ingrediente en una sección del súper por palabras clave. Las
+// keywords de una sola palabra exigen coincidencia de palabra completa (con
+// plural simple) para no confundir «sal» con «salmón»; las multi-palabra valen
+// como subcadena. Cae a «otros» si nada encaja.
+function ingredientCategory(name) {
+  const n = stripAccents(normName(name));
+  if (!n) return 'otros';
+  const words = n.split(/\s+/);
+  const wordSet = new Set(words);
+  for (const cat of SHOPPING_CATEGORIES) {
+    for (const kw of cat.keywords) {
+      const k = stripAccents(kw);
+      if (k.includes(' ')) {
+        if (n.includes(k)) return cat.id;
+      } else if (wordSet.has(k) || words.some(w => w === k + 's' || w + 's' === k || w === k + 'es')) {
+        return cat.id;
+      }
+    }
+  }
+  return 'otros';
+}
+
 function aggregateField(dishIds, fieldName) {
   // Devuelve Map<nameLower, {name, totals, raws, sources}>:
   // - totals: Map<unitKey, {dim, unit, value}> sumas de cantidades parseadas.
@@ -2100,14 +2370,20 @@ function aggregateField(dishIds, fieldName) {
   dishIds.forEach(id => {
     const dish = state.dishes.find(d => d.id === id);
     if (!dish) return;
-    // Solo cuentan los slots FRESCOS (no sobras): un batch se cocina una vez.
+    // Solo cuentan los slots FRESCOS (no sobras) y activos según el modo: un
+    // batch se cocina una vez.
     let occurrences = 0;
     state.week.forEach(day => {
-      if (day.lunch === id && !day.leftover?.lunch) occurrences++;
-      if (day.lunchStarter === id && !day.leftover?.lunchStarter) occurrences++;
-      if (day.dinner === id && !day.leftover?.dinner) occurrences++;
+      activeSlots().forEach(slot => {
+        if (day[slot] === id && !day.leftover?.[slot]) occurrences++;
+      });
     });
     if (occurrences === 0) return;   // solo aparece como sobras → no se cocina
+    // Factor de comensales: la receta está pensada para `servings` personas; se
+    // escala a los `diners` de casa. Solo afecta a cantidades numéricas; lo no
+    // parseable ("al gusto") no se escala. servings/diners por defecto = 2 → ×1.
+    const servings = dish.servings >= 1 ? dish.servings : 2;
+    const dinerFactor = state.diners >= 1 ? state.diners / servings : 1;
     (dish[fieldName] || []).forEach(item => {
       const key = normName(item.name);
       if (!key) return;
@@ -2121,7 +2397,7 @@ function aggregateField(dishIds, fieldName) {
         if (parsed) {
           const uk = parsed.dim === 'count' ? `count:${parsed.unit}` : parsed.dim;
           const cur = entry.totals.get(uk) || { dim: parsed.dim, unit: parsed.unit, value: 0 };
-          cur.value += parsed.value * occurrences;
+          cur.value += parsed.value * occurrences * dinerFactor;
           entry.totals.set(uk, cur);
         } else {
           entry.raws.set(rawQty, (entry.raws.get(rawQty) || 0) + occurrences);
@@ -2174,12 +2450,11 @@ async function buildShoppingList(renames = new Map()) {
     return;
   }
 
-  // Recolecta IDs de plato; incluye el entrante (cuenta como un plato más).
+  // Recolecta IDs de plato de los slots activos (incluye entrante y, en modo
+  // extendido, desayuno y merienda; cada uno cuenta como un plato más).
   const dishIds = new Set();
   state.week.forEach(day => {
-    if (day.lunch) dishIds.add(day.lunch);
-    if (day.lunchStarter) dishIds.add(day.lunchStarter);
-    if (day.dinner) dishIds.add(day.dinner);
+    activeSlots().forEach(slot => { if (day[slot]) dishIds.add(day[slot]); });
   });
 
   const ingredientsAgg = aggregateField(dishIds, 'ingredients');
@@ -2260,6 +2535,27 @@ function shoppingItemHtml(item) {
   `;
 }
 
+// Agrupa los ingredientes por sección del súper (orden de recorrido). Dentro de
+// cada sección, no marcados primero y marcados al final (sortShopping). Solo
+// pinta las secciones con contenido.
+function renderGroupedShopping(items) {
+  const byCat = new Map();
+  for (const it of items) {
+    const cat = ingredientCategory(it.name);
+    if (!byCat.has(cat)) byCat.set(cat, []);
+    byCat.get(cat).push(it);
+  }
+  const out = [];
+  for (const cat of SHOPPING_CATEGORIES) {
+    const group = byCat.get(cat.id);
+    if (!group || group.length === 0) continue;
+    sortShopping(group);
+    out.push(`<div class="shopping-cat">${cat.icon} ${escapeHtml(cat.label)}</div>`);
+    out.push(group.map(shoppingItemHtml).join(''));
+  }
+  return out.join('');
+}
+
 function renderShopping() {
   const list = document.getElementById('shoppingList');
   const empty = document.getElementById('emptyShopping');
@@ -2312,7 +2608,7 @@ function renderShopping() {
     const total = state.shopping.length;
     const checked = state.shopping.filter(s => s.checked).length;
     meta.innerHTML = `<span>${checked} / ${total}</span> · ingredientes para la semana${pantryNote ? ' · ' + pantryNote : ''}`;
-    list.innerHTML = state.shopping.map(shoppingItemHtml).join('');
+    list.innerHTML = renderGroupedShopping(state.shopping);
     list.querySelectorAll('.shopping-item').forEach(wireShoppingItem);
   } else {
     list.classList.remove('visible');
@@ -2412,15 +2708,27 @@ async function removeFromPantry(id) {
 function shoppingListText() {
   const lines = ['🛒 Lista de la compra · MiMenu', ''];
   if (state.shopping.length) {
-    lines.push('INGREDIENTES');
-    state.shopping.forEach(it => lines.push(`• ${it.name}${it.qty ? ` — ${it.qty}` : ''}`));
+    // Agrupa por sección del súper, igual que la vista.
+    const byCat = new Map();
+    for (const it of state.shopping) {
+      const cat = ingredientCategory(it.name);
+      if (!byCat.has(cat)) byCat.set(cat, []);
+      byCat.get(cat).push(it);
+    }
+    for (const cat of SHOPPING_CATEGORIES) {
+      const group = byCat.get(cat.id);
+      if (!group || !group.length) continue;
+      sortShopping(group);
+      lines.push(`${cat.icon} ${cat.label.toUpperCase()}`);
+      group.forEach(it => lines.push(`• ${it.name}${it.qty ? ` — ${it.qty}` : ''}`));
+      lines.push('');
+    }
   }
   if (state.spicesShopping.length) {
-    if (state.shopping.length) lines.push('');
     lines.push('ESPECIAS');
     state.spicesShopping.forEach(it => lines.push(`• ${it.name}${it.qty ? ` — ${it.qty}` : ''}`));
   }
-  return lines.join('\n');
+  return lines.join('\n').trim();
 }
 
 async function shareShoppingList() {
@@ -2489,7 +2797,7 @@ function computeStats() {
   const counts = new Map();   // dishId -> nº de apariciones
   let totalSlots = 0;
   state.history.forEach(w => (w.data || []).forEach(day => {
-    ['lunch', 'lunchStarter', 'dinner'].forEach(slot => {
+    SLOT_FIELDS.forEach(slot => {
       if (day[slot]) { counts.set(day[slot], (counts.get(day[slot]) || 0) + 1); totalSlots++; }
     });
   }));
@@ -2682,6 +2990,7 @@ const AI_DISH_SCHEMA = {
     yields: { type: 'INTEGER' },
     ingredients: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, qty: { type: 'STRING' } }, required: ['name'] } },
     spices: { type: 'ARRAY', items: { type: 'OBJECT', properties: { name: { type: 'STRING' }, qty: { type: 'STRING' } }, required: ['name'] } },
+    steps: { type: 'ARRAY', items: { type: 'STRING' } },
     tags: { type: 'ARRAY', items: { type: 'STRING' } },
     contains: { type: 'ARRAY', items: { type: 'STRING', enum: ['carne', 'pescado', 'gluten', 'lactosa', 'huevo', 'frutossecos'] } }
   },
@@ -2693,6 +3002,7 @@ Reglas:
 - "type": "comida", "cena" o "ambos". "role": "main" (principal), "starter" (entrante) o "complete" (plato único).
 - "season": "invierno" o "verano" solo si es claramente de temporada; si no, "any".
 - "ingredients": ingredientes principales con cantidad para 2 raciones (p. ej. "200 g", "2 dientes"). "spices": especias y condimentos aparte.
+- "steps": pasos de preparación en orden, en español, cada uno una frase breve y clara, SIN numerar.
 - "contains": marca SOLO los presentes entre carne, pescado, gluten, lactosa, huevo, frutossecos.
 - "yields": nº de comidas que rinde (1 normal; 2-4 si es batch cooking).
 Responde únicamente con el JSON conforme al esquema.`;
@@ -2725,7 +3035,30 @@ async function aiError(res) {
     const e = await res.json();
     msg = e?.error?.message || e?.error?.type || e?.message || msg;
   } catch {}
+  if (res.status === 429) msg = `límite de cuota alcanzado (429). ${msg}`;
   return new Error(msg);
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// fetch para la IA con reintentos ante errores transitorios: 429 (rate limit /
+// cuota), 500 y 503 (caída temporal del proveedor). Backoff exponencial con
+// jitter (1s, 2s, 4s…), respetando la cabecera `Retry-After` si el servidor la
+// envía. Los errores "definitivos" (401 clave mala, 400 petición inválida) NO se
+// reintentan: se devuelven al instante para que `aiError` los propague.
+const AI_MAX_RETRIES = 3;
+async function aiFetch(url, opts) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, opts);
+    const retryable = res.status === 429 || res.status === 500 || res.status === 503;
+    if (res.ok || !retryable || attempt >= AI_MAX_RETRIES) return res;
+    const ra = parseFloat(res.headers.get('retry-after'));
+    const waitMs = (Number.isFinite(ra) && ra > 0)
+      ? Math.min(ra * 1000, 30000)
+      : Math.min(1000 * Math.pow(2, attempt), 8000) + Math.floor(Math.random() * 400);
+    console.warn(`[IA] ${res.status} (${activeProvider().name}) — reintento ${attempt + 1}/${AI_MAX_RETRIES} en ${Math.round(waitMs)} ms`);
+    await sleep(waitMs);
+  }
 }
 
 // `parts` neutral: lista de {text} y/o {image:{mime,data}}. Cada backend admite
@@ -2740,7 +3073,7 @@ async function callGemini(key, system, parts, schema) {
   }
   const generationConfig = { responseMimeType: 'application/json', temperature: 0.4 };
   if (schema) generationConfig.responseSchema = schema;
-  const res = await fetch(url, {
+  const res = await aiFetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ contents: [{ parts: gParts }], generationConfig })
@@ -2756,7 +3089,7 @@ async function callClaude(key, system, parts) {
     if (p.text) content.push({ type: 'text', text: p.text });
     if (p.image) content.push({ type: 'image', source: { type: 'base64', media_type: p.image.mime, data: p.image.data } });
   }
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
+  const res = await aiFetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -2782,7 +3115,7 @@ async function callOpenAI(key, system, parts) {
     if (p.text) userContent.push({ type: 'text', text: p.text });
     if (p.image) userContent.push({ type: 'image_url', image_url: { url: `data:${p.image.mime};base64,${p.image.data}` } });
   }
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+  const res = await aiFetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${key}` },
     body: JSON.stringify({
@@ -2797,10 +3130,26 @@ async function callOpenAI(key, system, parts) {
   return extractJson(data?.choices?.[0]?.message?.content || '');
 }
 
+// Contabiliza una petición a la IA. Como toda función de IA se dispara con un
+// botón explícito, este contador solo debería subir cuando TÚ lo pides: si crece
+// solo, hay una llamada inesperada. Persiste el total y deja rastro en consola.
+async function recordAiRequest(label) {
+  state.aiRequestCount = (state.aiRequestCount || 0) + 1;
+  state.aiLastRequestAt = Date.now();
+  console.info(`[IA] petición #${state.aiRequestCount} · ${label} · ${activeProvider().name}/${activeProvider().model} · ${new Date(state.aiLastRequestAt).toLocaleTimeString('es')}`);
+  try {
+    await idb.put(STORE_SETTINGS, { key: 'aiRequestCount', value: state.aiRequestCount });
+    await idb.put(STORE_SETTINGS, { key: 'aiLastRequestAt', value: state.aiLastRequestAt });
+  } catch {}
+  updateAiUsage();
+}
+
 // Punto de entrada único: despacha al proveedor activo. Lanza 'NO_KEY' si falta.
-async function callAI({ system, parts, geminiSchema }) {
+// `label` identifica qué función disparó la petición (para el log de auditoría).
+async function callAI({ system, parts, geminiSchema }, label = 'IA') {
   const key = activeAiKey();
   if (!key) throw new Error('NO_KEY');
+  await recordAiRequest(label);
   if (state.aiProvider === 'claude') return callClaude(key, system, parts);
   if (state.aiProvider === 'openai') return callOpenAI(key, system, parts);
   return callGemini(key, system, parts, geminiSchema);
@@ -2860,6 +3209,7 @@ function sanitizeAiDishToPrefill(raw) {
     season: ['any', 'invierno', 'verano'].includes(o.season) ? o.season : 'any',
     ingredients: items(o.ingredients),
     spices: items(o.spices),
+    steps: Array.isArray(o.steps) ? o.steps.map(cleanStep).filter(Boolean) : [],
     tags,
     contains,
     yields: (typeof o.yields === 'number' && o.yields >= 1) ? Math.min(4, Math.round(o.yields)) : 1
@@ -2875,7 +3225,7 @@ async function generateDishWithAI() {
   if (!text && !hasImage) { showToast('Escribe algo o adjunta una foto'); return; }
   await withAiBusy(document.getElementById('aiGenerateBtn'), 'Generando…', async () => {
     const parts = await aiPartsFrom(text || 'Crea un plato a partir de esta foto.', 'aiImage');
-    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA });
+    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA }, 'Crear plato');
     const prefill = sanitizeAiDishToPrefill(raw);
     if (!prefill.name && prefill.ingredients.length === 0) { showToast('La IA no devolvió un plato válido'); return; }
     closeImport();
@@ -2891,7 +3241,7 @@ async function suggestDishFromPantry() {
   const list = state.pantry.map(p => p.name).join(', ');
   await withAiBusy(document.getElementById('pantrySuggestBtn'), 'Pensando…', async () => {
     const parts = [{ text: `Propón un plato que use sobre todo estos ingredientes que ya tengo en casa: ${list}. Puedes añadir 1-2 ingredientes básicos si hace falta.` }];
-    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA });
+    const raw = await callAI({ system: AI_DISH_PROMPT, parts, geminiSchema: AI_DISH_SCHEMA }, 'Despensa');
     const prefill = sanitizeAiDishToPrefill(raw);
     if (!prefill.name && prefill.ingredients.length === 0) { showToast('La IA no devolvió un plato válido'); return; }
     closePantry();
@@ -2920,7 +3270,7 @@ async function suggestTagsWithAI() {
   await withAiBusy(document.getElementById('aiSuggestTags'), '…', async () => {
     const system = `Clasificas platos. Devuelve JSON {tags, contains}. "tags": elige SOLO de esta lista las que apliquen (no inventes): ${allowed}. "contains": SOLO los presentes entre carne, pescado, gluten, lactosa, huevo, frutossecos.`;
     const parts = [{ text: `Plato: ${name}\nIngredientes: ${ings}` }];
-    const raw = await callAI({ system, parts, geminiSchema: AI_TAGS_SCHEMA });
+    const raw = await callAI({ system, parts, geminiSchema: AI_TAGS_SCHEMA }, 'Etiquetas');
     const lowerMap = new Map(availableTags().map(t => [normName(t), t]));
     const newTags = (Array.isArray(raw?.tags) ? raw.tags : [])
       .map(t => typeof t === 'string' ? lowerMap.get(normName(t)) : null).filter(Boolean);
@@ -2937,6 +3287,35 @@ async function suggestTagsWithAI() {
     renderModalTags();
     renderModalContains();
     showToast(added > 0 ? `IA: ${added} sugerencia(s) añadidas` : 'IA: nada nuevo que sugerir');
+  });
+}
+
+// Botón «Generar pasos con IA» del modal de plato: a partir del nombre y los
+// ingredientes ya escritos, devuelve los pasos de preparación (uno por línea).
+const AI_STEPS_SCHEMA = {
+  type: 'OBJECT',
+  properties: { steps: { type: 'ARRAY', items: { type: 'STRING' } } },
+  required: ['steps']
+};
+
+// Limpia un paso devuelto por la IA: quita numeración/markdown inicial y espacios.
+function cleanStep(s) {
+  return String(s == null ? '' : s).replace(/^\s*(\d+[.)]|[-*•])\s*/, '').trim();
+}
+
+async function generateStepsWithAI() {
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); return; }
+  const name = document.getElementById('dishName').value.trim();
+  const ings = state.modalIngredients.map(i => i.qty ? `${i.name} (${i.qty})` : i.name).join(', ');
+  if (!name && state.modalIngredients.length === 0) { showToast('Añade nombre o ingredientes primero'); return; }
+  await withAiBusy(document.getElementById('aiSuggestSteps'), 'Generando…', async () => {
+    const system = 'Eres un asistente de cocina. Devuelve los pasos de preparación de un plato como JSON {steps:[...]}, en español, en orden, cada paso una frase clara y breve, SIN numerar y sin markdown.';
+    const parts = [{ text: `Plato: ${name}\nIngredientes: ${ings}` }];
+    const raw = await callAI({ system, parts, geminiSchema: AI_STEPS_SCHEMA }, 'Pasos');
+    const steps = (Array.isArray(raw?.steps) ? raw.steps : []).map(cleanStep).filter(Boolean);
+    if (steps.length === 0) { showToast('La IA no devolvió pasos'); return; }
+    document.getElementById('dishSteps').value = steps.join('\n');
+    showToast(`IA: ${steps.length} pasos generados · revísalos`);
   });
 }
 
@@ -2966,13 +3345,15 @@ async function suggestWeekWithAI() {
   await withAiBusy(document.getElementById('suggestWeekBtn'), 'Planificando…', async () => {
     const system = `Planificas un menú semanal variado y equilibrado (7 días, Lunes a Domingo). Para cada día elige UNA comida y UNA cena de las listas dadas, usando EXACTAMENTE el nombre tal cual aparece. No repitas el mismo plato en días seguidos ni abuses de la misma etiqueta/proteína; prioriza la variedad. Devuelve JSON {days:[{lunch,dinner} ×7]}.`;
     const parts = [{ text: `COMIDAS disponibles:\n- ${lunches.map(fmt).join('\n- ')}\n\nCENAS disponibles:\n- ${dinners.map(fmt).join('\n- ')}` }];
-    const raw = await callAI({ system, parts, geminiSchema: AI_WEEK_SCHEMA });
+    const raw = await callAI({ system, parts, geminiSchema: AI_WEEK_SCHEMA }, 'Semana');
     const days = Array.isArray(raw?.days) ? raw.days : [];
     const lunchByName = new Map(lunches.map(d => [normName(d.name), d]));
     const dinnerByName = new Map(dinners.map(d => [normName(d.name), d]));
 
     await archiveCurrentWeek();
     await loadHistory();
+    const breakfasts = state.extendedMeals ? breakfastPool() : [];
+    const snacks = state.extendedMeals ? snackPool() : [];
     const week = Array.from({ length: 7 }, () => emptyDay());
     for (let i = 0; i < 7; i++) {
       const sel = days[i] || {};
@@ -2980,8 +3361,18 @@ async function suggestWeekWithAI() {
         || weightedPick(lunches, x => scoreDish(x, week, i, 'lunch'));
       const dinnerDish = (typeof sel.dinner === 'string' && dinnerByName.get(normName(sel.dinner)))
         || weightedPick(dinners, x => scoreDish(x, week, i, 'dinner'));
+      // Desayuno/merienda (modo extendido): la IA solo reparte comidas y cenas,
+      // así que estos los rellenamos con la selección ponderada normal.
+      if (state.extendedMeals && breakfasts.length) {
+        const b = weightedPick(breakfasts, x => scoreDish(x, week, i, 'breakfast'));
+        if (b) { week[i].breakfast = b.id; placeLeftovers(week, i, 'breakfast', b); }
+      }
       if (lunchDish) week[i].lunch = lunchDish.id;
       ensureStarter(week, i);
+      if (state.extendedMeals && snacks.length) {
+        const s = weightedPick(snacks, x => scoreDish(x, week, i, 'snack'));
+        if (s) { week[i].snack = s.id; placeLeftovers(week, i, 'snack', s); }
+      }
       if (dinnerDish) week[i].dinner = dinnerDish.id;
     }
 
@@ -2995,28 +3386,31 @@ async function suggestWeekWithAI() {
 }
 
 // ============ EXPORT / IMPORT ============
+// Serializa los 6 stores a un objeto (lo usan exportData y el backup en Drive).
+async function buildExportPayload() {
+  const dishes = await idb.getAll(STORE_DISHES);
+  const week = await idb.get(STORE_WEEK, 'current');
+  const shopping = await idb.getAll(STORE_SHOPPING);
+  const settings = await idb.getAll(STORE_SETTINGS);
+  const history = await idb.getAll(STORE_HISTORY);
+  const pantry = await idb.getAll(STORE_PANTRY);
+  return {
+    app: 'mise',
+    schemaVersion: DB_VERSION,
+    exportedAt: new Date().toISOString(),
+    dishes,
+    week: week?.data || null,
+    weekGeneratedAt: week?.generatedAt || null,
+    shopping,
+    settings,
+    history,
+    pantry
+  };
+}
+
 async function exportData() {
   try {
-    const dishes = await idb.getAll(STORE_DISHES);
-    const week = await idb.get(STORE_WEEK, 'current');
-    const shopping = await idb.getAll(STORE_SHOPPING);
-    const settings = await idb.getAll(STORE_SETTINGS);
-    const history = await idb.getAll(STORE_HISTORY);
-    const pantry = await idb.getAll(STORE_PANTRY);
-
-    const payload = {
-      app: 'mise',
-      schemaVersion: DB_VERSION,
-      exportedAt: new Date().toISOString(),
-      dishes,
-      week: week?.data || null,
-      weekGeneratedAt: week?.generatedAt || null,
-      shopping,
-      settings,
-      history,
-      pantry
-    };
-
+    const payload = await buildExportPayload();
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -3062,6 +3456,13 @@ function normalizeImportedDish(d) {
     spices: Array.isArray(d.spices)
       ? d.spices.filter(s => s && typeof s.name === 'string' && s.name.trim()).map(sanitizeItem)
       : [],
+    steps: Array.isArray(d.steps)
+      ? d.steps.map(s => String(s == null ? '' : s).trim()).filter(Boolean)
+      : [],
+    servings: typeof d.servings === 'number' && d.servings >= 1 ? Math.min(12, Math.round(d.servings)) : 2,
+    extraMeals: Array.isArray(d.extraMeals)
+      ? d.extraMeals.filter(m => m === 'desayuno' || m === 'merienda')
+      : [],
     createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now(),
     archived: typeof d.archived === 'boolean' ? d.archived : false
   };
@@ -3076,10 +3477,16 @@ async function importData(file) {
     showToast('JSON inválido');
     return;
   }
+  await applyImportedPayload(payload, { sourceLabel: 'archivo' });
+}
 
-  if (payload.app !== 'mise' || !Array.isArray(payload.dishes)) {
-    showToast('Archivo no compatible');
-    return;
+// Valida, normaliza y aplica un payload de export (de archivo o de Drive) a la
+// base de datos, reemplazando TODO de forma atómica. opts.sourceLabel personaliza
+// el texto del diálogo de confirmación.
+async function applyImportedPayload(payload, opts = {}) {
+  if (!payload || payload.app !== 'mise' || !Array.isArray(payload.dishes)) {
+    showToast('Datos no compatibles');
+    return false;
   }
 
   // Validar y normalizar cada plato: descarta los que no tengan id+name válidos.
@@ -3095,14 +3502,15 @@ async function importData(file) {
   }
 
   if (validDishes.length === 0 && payload.dishes.length > 0) {
-    showToast('Archivo sin platos válidos');
-    return;
+    showToast('Sin platos válidos');
+    return false;
   }
 
+  const origin = opts.sourceLabel === 'Drive' ? 'la copia de Google Drive' : 'el archivo';
   const msg = rejected > 0
-    ? `Esto reemplazará TODOS tus datos actuales. Se descartarán ${rejected} platos malformados. ¿Continuar?`
-    : 'Esto reemplazará TODOS tus datos actuales (platos, semana, lista, tema). ¿Continuar?';
-  if (!(await confirmDialog(msg, { title: 'Importar datos', confirmText: 'Importar', danger: true }))) return;
+    ? `Esto reemplazará TODOS tus datos actuales con ${origin}. Se descartarán ${rejected} platos malformados. ¿Continuar?`
+    : `Esto reemplazará TODOS tus datos actuales (platos, semana, lista, tema) con ${origin}. ¿Continuar?`;
+  if (!(await confirmDialog(msg, { title: 'Restaurar datos', confirmText: 'Reemplazar', danger: true }))) return false;
 
   try {
     // Una sola transacción sobre los 6 stores: o todo o nada.
@@ -3152,24 +3560,207 @@ async function importData(file) {
     await loadCustomTags();
     await loadSeasonMode();
     await loadShowSources();
+    await loadDiners();
     await loadRestrictions();
     await loadToggles();
+    await loadExtendedMeals();
     await loadAiSettings();
+    await loadGoogleSettings();
     await loadPantry();
     await loadHistory();
     applySeasonChip();
     applyShowSourcesCheckbox();
+    renderDinersControl();
     renderAccentSwatches();
     renderRestrictions();
     applyToggleButtons();
+    applyExtendedMealsToggle();
+    updateDriveStatus();
     await loadDishes();
     await loadWeek();
     await loadShopping();
-    showToast(rejected > 0 ? `Datos importados (${rejected} descartados)` : 'Datos importados');
+    showToast(rejected > 0 ? `Datos restaurados (${rejected} descartados)` : 'Datos restaurados');
+    return true;
   } catch (err) {
     console.error('Import failed:', err);
-    showToast('Error al importar');
+    showToast('Error al restaurar');
+    return false;
   }
+}
+
+// ============ BACKUP EN GOOGLE DRIVE (BYO OAuth) ============
+// El usuario crea un OAuth Client ID (tipo «Aplicación web») en Google Cloud y lo
+// pega aquí (igual que las claves de IA). Usamos Google Identity Services para un
+// token de acceso con scope `drive.appdata`: la copia vive en una carpeta privada
+// de SU Drive que solo esta app ve. Sin servidor ni base de datos propios.
+const DRIVE_FILE_NAME = 'mimenu-backup.json';
+const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+
+async function loadGoogleSettings() {
+  const cid = await idb.get(STORE_SETTINGS, 'googleClientId');
+  state.googleClientId = typeof cid?.value === 'string' ? cid.value : '';
+  const at = await idb.get(STORE_SETTINGS, 'driveSyncedAt');
+  state.driveSyncedAt = typeof at?.value === 'number' ? at.value : null;
+}
+
+function updateDriveStatus() {
+  const el = document.getElementById('driveStatus');
+  if (el) {
+    if (!state.googleClientId) {
+      el.textContent = 'Pega tu Client ID de Google para activar la copia en Drive.';
+      el.classList.remove('ok');
+    } else {
+      const last = state.driveSyncedAt
+        ? `última: ${new Date(state.driveSyncedAt).toLocaleString('es')}`
+        : 'aún no has hecho ninguna copia';
+      el.textContent = `Google Drive listo ✓ — ${last}.`;
+      el.classList.add('ok');
+    }
+  }
+  const input = document.getElementById('googleClientId');
+  if (input) input.placeholder = state.googleClientId ? 'Client ID guardado ✓ (pega otro para cambiarlo)' : 'Client ID de Google (…apps.googleusercontent.com)';
+}
+
+async function saveGoogleClientId() {
+  const input = document.getElementById('googleClientId');
+  if (!input) return;
+  const v = input.value.trim();
+  state.googleClientId = v;
+  await idb.put(STORE_SETTINGS, { key: 'googleClientId', value: v });
+  input.value = '';
+  updateDriveStatus();
+  showToast(v ? 'Client ID guardado' : 'Client ID borrado');
+}
+
+// Carga el script de Google Identity Services una sola vez (cross-origin; no lo
+// cachea el Service Worker, se trae bajo demanda al usar el backup).
+function ensureGisLoaded() {
+  return new Promise((resolve, reject) => {
+    if (window.google?.accounts?.oauth2) { resolve(); return; }
+    let s = document.getElementById('gis-script');
+    if (s) {
+      s.addEventListener('load', () => resolve());
+      s.addEventListener('error', () => reject(new Error('No se pudo cargar Google')));
+      return;
+    }
+    s = document.createElement('script');
+    s.id = 'gis-script';
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true; s.defer = true;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error('No se pudo cargar Google (¿sin conexión?)'));
+    document.head.appendChild(s);
+  });
+}
+
+// Pide un token de acceso OAuth (abre el popup de Google). Debe llamarse desde un
+// gesto del usuario (click) para que el navegador no bloquee el popup.
+async function getDriveToken() {
+  if (!state.googleClientId) throw new Error('Falta el Client ID de Google');
+  await ensureGisLoaded();
+  return new Promise((resolve, reject) => {
+    let client;
+    try {
+      client = google.accounts.oauth2.initTokenClient({
+        client_id: state.googleClientId,
+        scope: DRIVE_SCOPE,
+        callback: (resp) => (resp && resp.access_token) ? resolve(resp.access_token) : reject(new Error('Google no concedió permiso')),
+        error_callback: (err) => reject(new Error(err?.message || 'Acceso a Google cancelado'))
+      });
+    } catch (e) {
+      reject(new Error('Client ID de Google inválido'));
+      return;
+    }
+    client.requestAccessToken({ prompt: '' });
+  });
+}
+
+// Busca el archivo de copia en la carpeta privada de la app. null si no existe.
+async function driveFindBackup(token) {
+  const q = encodeURIComponent(`name='${DRIVE_FILE_NAME}'`);
+  const res = await fetch(`https://www.googleapis.com/drive/v3/files?spaces=appDataFolder&q=${q}&fields=files(id,name)`, {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  if (!res.ok) throw new Error('Drive: no pude consultar tus copias');
+  const data = await res.json();
+  return (data.files && data.files[0]) || null;
+}
+
+async function backupToDrive() {
+  if (!state.googleClientId) { showToast('Pega tu Client ID de Google primero'); return; }
+  const btn = document.getElementById('driveBackup');
+  if (btn) btn.disabled = true;
+  try {
+    const token = await getDriveToken();
+    const json = JSON.stringify(await buildExportPayload());
+    const existing = await driveFindBackup(token);
+    if (existing) {
+      const res = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${existing.id}?uploadType=media`, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: json
+      });
+      if (!res.ok) throw new Error('Drive: no pude actualizar la copia');
+    } else {
+      const boundary = '----mimenuBoundary7MA4YWxkTrZu0gW';
+      const metadata = { name: DRIVE_FILE_NAME, parents: ['appDataFolder'] };
+      const body =
+        `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
+        `--${boundary}\r\nContent-Type: application/json\r\n\r\n${json}\r\n` +
+        `--${boundary}--`;
+      const res = await fetch('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': `multipart/related; boundary=${boundary}` },
+        body
+      });
+      if (!res.ok) throw new Error('Drive: no pude crear la copia');
+    }
+    state.driveSyncedAt = Date.now();
+    await idb.put(STORE_SETTINGS, { key: 'driveSyncedAt', value: state.driveSyncedAt });
+    updateDriveStatus();
+    showToast('Copia guardada en Google Drive');
+  } catch (err) {
+    console.error('Drive backup failed:', err);
+    showToast(err?.message || 'Error al copiar a Drive');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function restoreFromDrive() {
+  if (!state.googleClientId) { showToast('Pega tu Client ID de Google primero'); return; }
+  const btn = document.getElementById('driveRestore');
+  if (btn) btn.disabled = true;
+  try {
+    const token = await getDriveToken();
+    const existing = await driveFindBackup(token);
+    if (!existing) { showToast('No hay ninguna copia en tu Drive'); return; }
+    const res = await fetch(`https://www.googleapis.com/drive/v3/files/${existing.id}?alt=media`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (!res.ok) throw new Error('Drive: no pude descargar la copia');
+    const payload = await res.json();
+    const ok = await applyImportedPayload(payload, { sourceLabel: 'Drive' });
+    if (ok) {
+      state.driveSyncedAt = Date.now();
+      await idb.put(STORE_SETTINGS, { key: 'driveSyncedAt', value: state.driveSyncedAt });
+      updateDriveStatus();
+    }
+  } catch (err) {
+    console.error('Drive restore failed:', err);
+    showToast(err?.message || 'Error al restaurar de Drive');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function initDrive() {
+  document.getElementById('saveGoogleClientId')?.addEventListener('click', saveGoogleClientId);
+  document.getElementById('driveBackup')?.addEventListener('click', backupToDrive);
+  document.getElementById('driveRestore')?.addEventListener('click', restoreFromDrive);
+  document.getElementById('googleClientId')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); saveGoogleClientId(); }
+  });
 }
 
 // ============ INIT ============
@@ -3182,22 +3773,30 @@ async function init() {
     await loadCustomTags();
     await loadSeasonMode();
     await loadShowSources();
+    await loadDiners();
     await loadRestrictions();
     await loadToggles();
+    await loadExtendedMeals();
     await loadAiSettings();
+    await loadGoogleSettings();
     await loadPantry();
     await loadHistory();
     initTabs();
     initFilters();
     initSeasonFilter();
     initShowSourcesToggle();
+    initDinersControl();
     initSearch();
     initToggles();
+    initExtendedMealsToggle();
+    initDrive();
     applySeasonChip();
     applyShowSourcesCheckbox();
+    renderDinersControl();
     renderAccentSwatches();
     renderRestrictions();
     applyToggleButtons();
+    applyExtendedMealsToggle();
     document.getElementById('drawerVersion').textContent = `MiMenu · v${APP_VERSION}`;
 
     // Event handlers
@@ -3250,6 +3849,7 @@ async function init() {
     });
     document.getElementById('saveAiKey')?.addEventListener('click', saveAiKeyFromInput);
     document.getElementById('clearAiKey')?.addEventListener('click', clearActiveAiKey);
+    document.getElementById('resetAiCount')?.addEventListener('click', resetAiCount);
     document.getElementById('aiKey')?.addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); saveAiKeyFromInput(); }
     });
@@ -3293,6 +3893,7 @@ async function init() {
       if (e.key === 'Enter') { e.preventDefault(); addIngredient(); }
     });
 
+    document.getElementById('aiSuggestSteps')?.addEventListener('click', generateStepsWithAI);
     document.getElementById('addNewTag').addEventListener('click', addCustomTag);
     document.getElementById('newTagInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') { e.preventDefault(); addCustomTag(); }

@@ -348,26 +348,30 @@ body {
   border-radius: 100px;
 }
 
-.dish-ingredients {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  padding-top: 10px;
-  border-top: 1px solid var(--line-soft);
+.dish-season {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 2px 8px;
+  border-radius: 100px;
 }
 
-.dish-ingredient-tag {
+.dish-season.season-verano {
+  color: #b45309;
+  background: rgba(245, 158, 11, 0.15);
+}
+
+.dish-season.season-invierno {
+  color: #2563eb;
+  background: rgba(59, 130, 246, 0.15);
+}
+
+.dish-recipe {
   font-size: 11px;
+  font-weight: 500;
   color: var(--ink-muted);
   background: var(--bg-elev-2);
-  padding: 2px 7px;
-  border-radius: 4px;
-}
-
-.dish-ingredient-more {
-  font-size: 11px;
-  color: var(--ink-soft);
-  padding: 2px 4px;
+  padding: 2px 8px;
+  border-radius: 100px;
 }
 
 /* ============ EMPTY STATE ============ */
@@ -1374,6 +1378,32 @@ body {
 .star.on { color: var(--accent); }
 .rating-clear { background: none; border: none; color: var(--ink-soft); font: inherit; font-size: 12px; cursor: pointer; margin-left: 10px; text-decoration: underline; }
 .rating-clear:hover { color: var(--ink); }
+
+/* Stepper (raciones de la receta, comensales): − valor + */
+.stepper { display: inline-flex; align-items: center; gap: 10px; }
+.stepper-btn {
+  width: 30px; height: 30px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--bg-elev-2);
+  color: var(--ink); font-size: 18px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+.stepper-btn:hover { border-color: var(--accent); color: var(--accent); }
+.stepper-btn:active { transform: scale(0.92); }
+.stepper-value { min-width: 80px; text-align: center; font-size: 14px; font-weight: 500; color: var(--ink); }
+
+/* Control de comensales en la vista Compra */
+.diners-control { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.diners-label { font-size: 13px; color: var(--ink-muted); }
+.diners-control .stepper-value { min-width: 24px; }
+
+/* Compra: cabecera de sección del súper */
+.shopping-cat {
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--ink-muted); margin: 16px 0 6px; padding-bottom: 5px;
+  border-bottom: 1px solid var(--line-soft);
+}
+.shopping-cat:first-child { margin-top: 0; }
 
 /* Semana: locks, sobras, drag & drop */
 .meal-line { padding-right: 84px; }            /* sitio para hasta 3 acciones */
