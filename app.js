@@ -4,7 +4,7 @@
 
 // ============ INDEXED DB ============
 const DB_NAME = 'mise-db';
-const DB_VERSION = 7;
+const DB_VERSION = 8;
 const STORE_DISHES = 'dishes';
 const STORE_WEEK = 'week';
 const STORE_SHOPPING = 'shopping';
@@ -133,6 +133,23 @@ function openDB() {
           cursor.continue();
         };
       }
+
+      // v7 -> v8: caducidad en la despensa. Backfill `expiresAt: null` (sin
+      // fecha), `addedAt` y `estimated: false` en cada item de pantry.
+      if (oldVersion < 8 && database.objectStoreNames.contains(STORE_PANTRY)) {
+        const store = upgradeTx.objectStore(STORE_PANTRY);
+        store.openCursor().onsuccess = (event) => {
+          const cursor = event.target.result;
+          if (!cursor) return;
+          const item = cursor.value;
+          let mutated = false;
+          if (!('expiresAt' in item)) { item.expiresAt = null; mutated = true; }
+          if (typeof item.addedAt !== 'number') { item.addedAt = Date.now(); mutated = true; }
+          if (typeof item.estimated !== 'boolean') { item.estimated = false; mutated = true; }
+          if (mutated) cursor.update(item);
+          cursor.continue();
+        };
+      }
     };
   });
 }
@@ -186,8 +203,9 @@ let state = {
   useRatings: true,    // si las valoraciones influyen en la generación
   useHistory: true,    // si el historial penaliza repetir semanas recientes
   showSources: false,  // toggle UI: mostrar plato origen en cada item de la compra
-  pantry: [],          // [{id, name}] ingredientes que ya tienes en casa
+  pantry: [],          // [{id, name, expiresAt, addedAt, estimated}] lo que ya tienes en casa
   pantryHidden: 0,     // nº de items ocultados de la compra por estar en despensa
+  pantryAlertDismissed: false, // el aviso de caducidad se cerró en esta sesión
   weekGeneratedAt: null,
   history: [],         // [{id, data, generatedAt, archivedAt}] semanas archivadas
   recentDishIds: new Set(), // ids de platos de la última semana archivada (penalización)
@@ -227,7 +245,7 @@ const DAYS = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', '
 
 const BUILTIN_TAGS = ['pasta', 'arroz', 'legumbre', 'pescado', 'carne', 'ave', 'huevo', 'verdura', 'sopa', 'ensalada'];
 
-const APP_VERSION = '1.8.0';
+const APP_VERSION = '1.9.0';
 
 // Paleta curada de acentos. `indigo` (por defecto) no define vars: deja que el
 // CSS aplique los valores afinados por tema (dark/light) de :root. El resto
@@ -254,6 +272,11 @@ const ACCENTS = {
 
 // Historial de cambios. El primero es el más reciente y se marca como "actual".
 const CHANGELOG = [
+  { version: '1.9.0', date: 'Junio 2026', items: [
+    'Despensa con caducidad: fotografía el recibo de la compra (o tu nevera) y la IA detecta los productos y estima su fecha (editable a mano).',
+    'La despensa se agrupa en caducados, cerca de caducar y el resto.',
+    'Aviso al abrir la app si tienes productos caducados o a punto de caducar; toca para revisarlos.'
+  ]},
   { version: '1.8.0', date: 'Junio 2026', items: [
     'Pasos de preparación en cada plato, con botón para generarlos con IA.',
     'Comensales: ajusta cuántos sois y la lista de la compra escala las cantidades.',
@@ -588,7 +611,57 @@ function initExtendedMealsToggle() {
 
 async function loadPantry() {
   const all = await idb.getAll(STORE_PANTRY);
+  all.forEach(p => {
+    if (!('expiresAt' in p)) p.expiresAt = null;
+    if (typeof p.addedAt !== 'number') p.addedAt = Date.now();
+    if (typeof p.estimated !== 'boolean') p.estimated = false;
+  });
   state.pantry = all.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+}
+
+// Días de calendario hasta que caduca un item (negativo = ya caducado, null = sin
+// fecha). Compara por día natural, ignorando la hora.
+const EXPIRY_SOON_DAYS = 2;   // «cerca de caducar»: hoy + los próximos N días
+function daysUntilExpiry(expiresAt) {
+  if (expiresAt == null) return null;
+  const d = new Date(expiresAt); d.setHours(0, 0, 0, 0);
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  return Math.round((d.getTime() - today.getTime()) / 86400000);
+}
+// Marca de tiempo del inicio del día de hoy (para calcular caducidades estimadas).
+function startOfToday() {
+  const t = new Date(); t.setHours(0, 0, 0, 0);
+  return t.getTime();
+}
+// Clasifica un item por su caducidad: 'expired' | 'soon' | 'ok' (sin fecha o lejana).
+function expiryBucket(expiresAt) {
+  const d = daysUntilExpiry(expiresAt);
+  if (d == null) return 'ok';
+  if (d < 0) return 'expired';
+  if (d <= EXPIRY_SOON_DAYS) return 'soon';
+  return 'ok';
+}
+
+// Etiqueta legible del estado de caducidad de un item.
+function expiryLabel(item) {
+  const d = daysUntilExpiry(item.expiresAt);
+  if (d == null) return 'Sin fecha';
+  let txt;
+  if (d < 0) txt = d === -1 ? 'Caducó ayer' : `Caducó hace ${-d} días`;
+  else if (d === 0) txt = 'Caduca hoy';
+  else if (d === 1) txt = 'Caduca mañana';
+  else txt = `Caduca en ${d} días`;
+  return item.estimated ? `${txt} · est.` : txt;
+}
+
+// timestamp → 'AAAA-MM-DD' para un <input type="date"> ('' si no hay fecha).
+function toDateInputValue(ts) {
+  if (ts == null) return '';
+  const d = new Date(ts);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 
 async function loadHistory() {
@@ -1043,7 +1116,8 @@ function renderDishes() {
   };
 
   grid.innerHTML = filtered.map(dish => {
-    const typeLabel = dish.type === 'ambos' ? 'Comida · Cena' : (dish.type.charAt(0).toUpperCase() + dish.type.slice(1));
+    const dtype = dish.type || 'comida';
+    const typeLabel = dtype === 'ambos' ? 'Comida · Cena' : (dtype.charAt(0).toUpperCase() + dtype.slice(1));
     const tags = Array.isArray(dish.tags) ? dish.tags : [];
     const contains = Array.isArray(dish.contains) ? dish.contains : [];
     const yields = dish.yields || 1;
@@ -2076,7 +2150,10 @@ function scoreDish(dish, week, slotDay, slotMeal) {
     for (const meal of SLOT_FIELDS) {
       if (d === slotDay && meal === slotMeal) continue;
       const otherId = week[d][meal];
-      if (!otherId) continue;
+      // Las sobras (leftover) son la MISMA comida cocinada una sola vez: no cuentan
+      // como apariciones extra del plato ni de sus tags (igual que en la compra).
+      // Sin esto, un batch que rinde 4 penalizaría 4× su propio plato y sus tags.
+      if (!otherId || week[d].leftover?.[meal]) continue;
       const other = state.dishes.find(x => x.id === otherId);
       if (!other) continue;
       const adjacent = isAdjacentSlot(slotDay, slotMeal, d, meal);
@@ -2680,19 +2757,44 @@ async function clearChecks() {
 }
 
 // ============ DESPENSA ============
-async function addToPantry(name) {
+async function addToPantry(name, opts = {}) {
   const clean = (name || '').trim();
   if (!clean) return;
-  const exists = state.pantry.some(p => normName(p.name) === normName(clean));
-  if (!exists) {
-    const entry = { id: uid(), name: clean };
+  const existing = state.pantry.find(p => normName(p.name) === normName(clean));
+  const hasDate = opts.expiresAt != null;
+  if (existing) {
+    // Si ya está y se aporta una fecha, la actualizamos (p. ej. al re-escanear).
+    if (hasDate) {
+      existing.expiresAt = opts.expiresAt;
+      existing.estimated = !!opts.estimated;
+      await idb.put(STORE_PANTRY, existing);
+    }
+  } else {
+    const entry = {
+      id: uid(), name: clean,
+      expiresAt: hasDate ? opts.expiresAt : null,
+      estimated: hasDate ? !!opts.estimated : false,
+      addedAt: Date.now()
+    };
     state.pantry.push(entry);
     state.pantry.sort((a, b) => a.name.localeCompare(b.name, 'es'));
     await idb.put(STORE_PANTRY, entry);
   }
   await buildShoppingList();   // re-filtra: lo que ya tienes desaparece de la compra
   renderPantry();
-  showToast(`"${clean}" guardado en la despensa`);
+  showToast(existing && !hasDate
+    ? `"${clean}" ya estaba en la despensa`
+    : `"${clean}" guardado en la despensa`);
+}
+
+// Actualiza la fecha de caducidad de un item (edición manual). null = sin fecha.
+async function setPantryExpiry(id, expiresAt) {
+  const item = state.pantry.find(p => p.id === id);
+  if (!item) return;
+  item.expiresAt = expiresAt;
+  item.estimated = false;   // editada a mano → ya no es estimación
+  await idb.put(STORE_PANTRY, item);
+  renderPantry();
 }
 
 async function removeFromPantry(id) {
@@ -2759,19 +2861,87 @@ function renderPantry() {
   const list = document.getElementById('pantryList');
   if (!list) return;
   if (state.pantry.length === 0) {
-    list.innerHTML = `<li class="pantry-empty">Aún no hay nada. Marca «ya lo tengo» 🏠 en la lista de la compra, o añádelo aquí arriba.</li>`;
+    list.innerHTML = `<li class="pantry-empty">Aún no hay nada. Marca «ya lo tengo» 🏠 en la lista de la compra, escanea una foto con IA, o añádelo aquí arriba.</li>`;
     return;
   }
-  list.innerHTML = state.pantry.map(p => `
-    <li>
-      <span class="ing-name">${escapeHtml(p.name)}</span>
+
+  // Agrupa por estado de caducidad; dentro de cada grupo, lo más urgente primero.
+  const buckets = { expired: [], soon: [], ok: [] };
+  state.pantry.forEach(p => buckets[expiryBucket(p.expiresAt)].push(p));
+  const sortBucket = (arr) => arr.sort((a, b) => {
+    const va = daysUntilExpiry(a.expiresAt); const vb = daysUntilExpiry(b.expiresAt);
+    const na = va == null ? Infinity : va; const nb = vb == null ? Infinity : vb;
+    if (na !== nb) return na - nb;
+    return a.name.localeCompare(b.name, 'es');
+  });
+  Object.values(buckets).forEach(sortBucket);
+
+  const itemHtml = (p) => `
+    <li class="pantry-item bucket-${expiryBucket(p.expiresAt)}">
+      <div class="pantry-item-main">
+        <span class="ing-name">${escapeHtml(p.name)}</span>
+        <span class="pantry-expiry">${escapeHtml(expiryLabel(p))}</span>
+      </div>
+      <input type="date" class="pantry-date" data-id="${p.id}" value="${toDateInputValue(p.expiresAt)}" aria-label="Fecha de caducidad de ${escapeAttr(p.name)}" />
       <button type="button" class="ing-remove" data-id="${p.id}" aria-label="Quitar de la despensa">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
       </button>
-    </li>`).join('');
+    </li>`;
+
+  const groups = [
+    { id: 'expired', label: '⚠️ Caducados' },
+    { id: 'soon', label: '🟠 Cerca de caducar' },
+    { id: 'ok', label: 'Resto' }
+  ];
+  list.innerHTML = groups.map(g => {
+    const items = buckets[g.id];
+    if (!items.length) return '';
+    return `<li class="pantry-group bucket-${g.id}">${g.label} <span class="pantry-group-count">${items.length}</span></li>`
+      + items.map(itemHtml).join('');
+  }).join('');
+
   list.querySelectorAll('.ing-remove').forEach(btn => {
     btn.addEventListener('click', () => removeFromPantry(btn.dataset.id));
   });
+  list.querySelectorAll('.pantry-date').forEach(inp => {
+    inp.addEventListener('change', () => {
+      const v = inp.value ? new Date(inp.value + 'T00:00:00').getTime() : null;
+      setPantryExpiry(inp.dataset.id, v);
+    });
+  });
+}
+
+// Aviso al iniciar la PWA: cuenta caducados y próximos a caducar y muestra un
+// banner clickable que lleva a la despensa. Solo se muestra si hay algo que avisar.
+function checkExpiringPantry() {
+  const alert = document.getElementById('pantryAlert');
+  const textEl = document.getElementById('pantryAlertText');
+  if (!alert || !textEl) return;
+  if (state.pantryAlertDismissed) { alert.hidden = true; return; }
+  let expired = 0, soon = 0;
+  state.pantry.forEach(p => {
+    const b = expiryBucket(p.expiresAt);
+    if (b === 'expired') expired++;
+    else if (b === 'soon') soon++;
+  });
+  if (expired === 0 && soon === 0) { alert.hidden = true; return; }
+  const parts = [];
+  if (expired > 0) parts.push(`${expired} ${expired === 1 ? 'producto ha caducado' : 'productos han caducado'}`);
+  if (soon > 0) parts.push(`${soon} ${soon === 1 ? 'está cerca de caducar' : 'están cerca de caducar'}`);
+  textEl.textContent = `${parts.join(' y ')}. Toca para revisar la despensa.`;
+  alert.hidden = false;
+}
+
+function initPantryAlert() {
+  const alert = document.getElementById('pantryAlert');
+  const close = document.getElementById('pantryAlertClose');
+  if (!alert) return;
+  const open = () => { alert.hidden = true; openPantry(); };
+  alert.addEventListener('click', open);
+  alert.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open(); }
+  });
+  if (close) close.addEventListener('click', (e) => { e.stopPropagation(); state.pantryAlertDismissed = true; alert.hidden = true; });
 }
 
 function openPantry() {
@@ -2781,6 +2951,7 @@ function openPantry() {
 }
 function closePantry() {
   document.getElementById('pantryBackdrop').classList.remove('visible');
+  checkExpiringPantry();   // re-evalúa el aviso por si arreglaste fechas/productos
 }
 async function addPantryFromInput() {
   const input = document.getElementById('pantryInput');
@@ -3099,7 +3270,7 @@ async function callClaude(key, system, parts) {
     },
     body: JSON.stringify({
       model: AI_PROVIDERS.claude.model,
-      max_tokens: 1500,
+      max_tokens: 4096,
       system: (system || '') + '\nResponde SOLO con el JSON, sin texto adicional ni vallas de código.',
       messages: [{ role: 'user', content }]
     })
@@ -3231,6 +3402,70 @@ async function generateDishWithAI() {
     closeImport();
     openCreateDish(prefill);
     showToast('Plato sugerido por IA · revísalo y guarda');
+  });
+}
+
+// Botón «Escanear con IA» del modal Despensa: a partir de una foto —ya sea un
+// recibo/ticket de compra o una foto de la nevera/despensa— la IA lista los
+// productos y estima su vida útil típica (días desde hoy). La fecha resultante
+// es orientativa y editable a mano (estimated:true).
+const AI_PANTRY_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    products: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: { name: { type: 'STRING' }, shelfLifeDays: { type: 'INTEGER' } },
+        required: ['name']
+      }
+    }
+  },
+  required: ['products']
+};
+
+// Inserta/actualiza en la despensa los productos detectados, calculando la fecha
+// estimada de caducidad = hoy + shelfLifeDays. Hace un solo refresco al final.
+async function applyPantryScan(products) {
+  let added = 0, updated = 0;
+  for (const p of products) {
+    const name = (p.name || '').trim();
+    if (!name) continue;
+    const days = (typeof p.shelfLifeDays === 'number' && p.shelfLifeDays > 0) ? Math.round(p.shelfLifeDays) : null;
+    const expiresAt = days != null ? startOfToday() + days * 86400000 : null;
+    const existing = state.pantry.find(x => normName(x.name) === normName(name));
+    if (existing) {
+      existing.expiresAt = expiresAt;
+      existing.estimated = expiresAt != null;
+      await idb.put(STORE_PANTRY, existing);
+      updated++;
+    } else {
+      const entry = { id: uid(), name, expiresAt, estimated: expiresAt != null, addedAt: Date.now() };
+      state.pantry.push(entry);
+      await idb.put(STORE_PANTRY, entry);
+      added++;
+    }
+  }
+  state.pantry.sort((a, b) => a.name.localeCompare(b.name, 'es'));
+  await buildShoppingList();
+  renderPantry();
+  showToast(`Despensa: ${added} añadido(s)${updated ? `, ${updated} actualizado(s)` : ''} · revisa las fechas`);
+}
+
+async function scanPantryWithAI() {
+  if (!aiConfigured()) { showToast('Configura una clave de IA en Ajustes'); closePantry(); openDrawer(); return; }
+  const fileInput = document.getElementById('pantryScanImage');
+  const hasImage = !!(fileInput && fileInput.files && fileInput.files[0]);
+  if (!hasImage) { showToast('Haz o adjunta una foto del recibo o de la despensa'); return; }
+  await withAiBusy(document.getElementById('pantryScanBtn'), 'Analizando…', async () => {
+    const system = 'Eres un asistente de cocina. La foto puede ser un RECIBO/TICKET de compra de supermercado o una foto de una despensa/nevera. Si es un recibo, lee las líneas de producto: expande las abreviaturas a nombres de alimento en español (ej.: "LECHE SEMI" → "leche", "PECHUGA POLLO" → "pechuga de pollo") y descarta todo lo que no sea comida ni bebida (totales, subtotal, IVA, descuentos, puntos, bolsa, fecha, cambio, tarjeta, nombre del súper). Si es una foto de despensa o nevera, lista los productos de comida visibles. En ambos casos, para cada producto estima "shelfLifeDays": los días de vida útil TÍPICA que le quedan desde hoy a un producto así recién comprado (ej.: plátano 5, leche fresca 6, yogur 18, huevos 21, verdura fresca 7, pan 4, conserva o producto seco 365). Devuelve JSON {products:[{name, shelfLifeDays}]} en español, con nombres cortos y genéricos (sin marcas ni cantidades).';
+    const parts = await aiPartsFrom('Lista los productos de comida de esta foto (recibo de compra o despensa/nevera).', 'pantryScanImage');
+    const raw = await callAI({ system, parts, geminiSchema: AI_PANTRY_SCHEMA }, 'Despensa escaneo');
+    const products = (Array.isArray(raw?.products) ? raw.products : [])
+      .filter(p => p && typeof p.name === 'string' && p.name.trim());
+    if (products.length === 0) { showToast('No reconocí productos en la foto'); return; }
+    if (fileInput) fileInput.value = '';
+    await applyPantryScan(products);
   });
 }
 
@@ -3461,7 +3696,7 @@ function normalizeImportedDish(d) {
       : [],
     servings: typeof d.servings === 'number' && d.servings >= 1 ? Math.min(12, Math.round(d.servings)) : 2,
     extraMeals: Array.isArray(d.extraMeals)
-      ? d.extraMeals.filter(m => m === 'desayuno' || m === 'merienda')
+      ? [...new Set(d.extraMeals.filter(m => m === 'desayuno' || m === 'merienda'))]
       : [],
     createdAt: typeof d.createdAt === 'number' ? d.createdAt : Date.now(),
     archived: typeof d.archived === 'boolean' ? d.archived : false
@@ -3541,8 +3776,15 @@ async function applyImportedPayload(payload, opts = {}) {
           generatedAt: payload.weekGeneratedAt || Date.now()
         });
       }
-      (payload.shopping || []).forEach(s => shoppingStore.put(s));
-      (payload.settings || []).forEach(s => settingsStore.put(s));
+      // shopping (keyPath 'id') y settings (keyPath 'key') se filtran por shape,
+      // igual que history/pantry: un único item sin clave lanzaría DataError
+      // síncrono y abortaría toda la restauración (que por lo demás es válida).
+      (Array.isArray(payload.shopping) ? payload.shopping : []).forEach(s => {
+        if (s && typeof s.id === 'string') shoppingStore.put(s);
+      });
+      (Array.isArray(payload.settings) ? payload.settings : []).forEach(s => {
+        if (s && typeof s.key === 'string') settingsStore.put(s);
+      });
       (Array.isArray(payload.history) ? payload.history : []).forEach(h => {
         if (h && typeof h.id === 'string' && Array.isArray(h.data)) historyStore.put(h);
       });
@@ -3633,24 +3875,27 @@ async function saveGoogleClientId() {
 }
 
 // Carga el script de Google Identity Services una sola vez (cross-origin; no lo
-// cachea el Service Worker, se trae bajo demanda al usar el backup).
+// cachea el Service Worker, se trae bajo demanda al usar el backup). Cacheamos la
+// promesa: las llamadas concurrentes o posteriores reutilizan la misma carga en
+// vuelo en lugar de re-adjuntar listeners a un <script> cuyo 'load' quizá ya pasó
+// (lo que dejaba la promesa colgada y el botón de backup bloqueado para siempre).
+let gisLoadPromise = null;
 function ensureGisLoaded() {
-  return new Promise((resolve, reject) => {
-    if (window.google?.accounts?.oauth2) { resolve(); return; }
-    let s = document.getElementById('gis-script');
-    if (s) {
-      s.addEventListener('load', () => resolve());
-      s.addEventListener('error', () => reject(new Error('No se pudo cargar Google')));
-      return;
-    }
-    s = document.createElement('script');
+  if (window.google?.accounts?.oauth2) return Promise.resolve();
+  if (gisLoadPromise) return gisLoadPromise;
+  gisLoadPromise = new Promise((resolve, reject) => {
+    const s = document.createElement('script');
     s.id = 'gis-script';
     s.src = 'https://accounts.google.com/gsi/client';
     s.async = true; s.defer = true;
     s.onload = () => resolve();
-    s.onerror = () => reject(new Error('No se pudo cargar Google (¿sin conexión?)'));
+    s.onerror = () => {
+      gisLoadPromise = null;   // permite reintentar tras un fallo de red
+      reject(new Error('No se pudo cargar Google (¿sin conexión?)'));
+    };
     document.head.appendChild(s);
   });
+  return gisLoadPromise;
 }
 
 // Pide un token de acceso OAuth (abre el popup de Google). Debe llamarse desde un
@@ -3790,6 +4035,7 @@ async function init() {
     initToggles();
     initExtendedMealsToggle();
     initDrive();
+    initPantryAlert();
     applySeasonChip();
     applyShowSourcesCheckbox();
     renderDinersControl();
@@ -3840,6 +4086,7 @@ async function init() {
     document.getElementById('importTextBtn').addEventListener('click', importRecipeFromText);
     document.getElementById('aiGenerateBtn')?.addEventListener('click', generateDishWithAI);
     document.getElementById('pantrySuggestBtn')?.addEventListener('click', suggestDishFromPantry);
+    document.getElementById('pantryScanBtn')?.addEventListener('click', scanPantryWithAI);
     document.getElementById('suggestWeekBtn')?.addEventListener('click', suggestWeekWithAI);
     document.getElementById('aiSuggestTags')?.addEventListener('click', suggestTagsWithAI);
 
@@ -3923,9 +4170,21 @@ async function init() {
     await loadDishes();
     await loadWeek();
     await loadShopping();
+    checkExpiringPantry();   // aviso de caducidad al abrir la PWA
 
-    // Register service worker
+    // Register service worker. Si YA había un SW controlando (no es la primera
+    // visita), recargamos una sola vez cuando uno nuevo tome el control: así no
+    // queda app.js/styles.css (cache-first) desencajado del index.html
+    // (network-first) tras subir CACHE_NAME en un despliegue.
     if ('serviceWorker' in navigator) {
+      if (navigator.serviceWorker.controller) {
+        let reloading = false;
+        navigator.serviceWorker.addEventListener('controllerchange', () => {
+          if (reloading) return;
+          reloading = true;
+          location.reload();
+        });
+      }
       navigator.serviceWorker.register('sw.js').catch(err => console.warn('SW registration failed:', err));
     }
   } catch (err) {

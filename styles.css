@@ -1486,6 +1486,52 @@ body.dragging-day { user-select: none; -webkit-user-select: none; cursor: grabbi
 .pantry-note { color: var(--ink-muted); font-weight: 500; }
 .pantry-empty { color: var(--ink-soft); font-size: 13px; line-height: 1.5; list-style: none; padding: 8px 2px; }
 
+/* Banner de aviso de caducidad al iniciar la PWA (clickable → despensa) */
+.pantry-alert {
+  display: flex; align-items: center; gap: 10px;
+  width: 100%; margin-bottom: 20px; padding: 12px 14px;
+  background: var(--accent-soft); border: 1px solid var(--accent);
+  border-radius: 12px; cursor: pointer; color: var(--ink);
+  font-family: inherit; font-size: 13.5px; text-align: left;
+  transition: border-color 0.15s ease;
+}
+.pantry-alert[hidden] { display: none; }
+.pantry-alert:hover { border-color: var(--accent-strong); }
+.pantry-alert-icon { font-size: 18px; line-height: 1; }
+.pantry-alert-text { flex: 1; line-height: 1.4; }
+.pantry-alert-close {
+  background: transparent; border: none; color: var(--ink-muted);
+  cursor: pointer; padding: 2px; display: flex; border-radius: 4px; flex: none;
+}
+.pantry-alert-close:hover { color: var(--ink); }
+.pantry-alert-close svg { width: 16px; height: 16px; }
+
+/* Despensa con caducidad: cabeceras de grupo, fecha editable, colores por estado */
+.pantry-group {
+  list-style: none; background: none !important; border: none !important;
+  padding: 12px 2px 2px !important;
+  font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--ink-muted);
+}
+.pantry-group.bucket-expired { color: var(--danger); }
+.pantry-group.bucket-soon { color: #b45309; }
+.pantry-group-count { font-weight: 500; opacity: 0.7; }
+
+.pantry-item { border-left-width: 3px !important; }
+.pantry-item.bucket-expired { border-left-color: var(--danger) !important; }
+.pantry-item.bucket-soon { border-left-color: #f59e0b !important; }
+.pantry-item-main { flex: 1; display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.pantry-item-main .ing-name { flex: none; }
+.pantry-expiry { font-size: 11px; color: var(--ink-soft); }
+.pantry-item.bucket-expired .pantry-expiry { color: var(--danger); font-weight: 500; }
+.pantry-item.bucket-soon .pantry-expiry { color: #b45309; font-weight: 500; }
+.pantry-date {
+  font-family: inherit; font-size: 12px; color: var(--ink-muted);
+  background: var(--bg-elev-2); border: 1px solid var(--line);
+  border-radius: 6px; padding: 4px 6px; max-width: 140px;
+}
+.pantry-date:focus { outline: none; border-color: var(--accent); }
+
 /* Drawer: restricciones y toggles */
 .restriction-chips { margin-bottom: 0; }
 .toggle-row {

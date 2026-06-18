@@ -50,6 +50,15 @@
 
   <main>
 
+    <!-- Aviso de caducidad de la despensa (al iniciar la PWA) -->
+    <div class="pantry-alert" id="pantryAlert" role="button" tabindex="0" hidden>
+      <span class="pantry-alert-icon" aria-hidden="true">⏰</span>
+      <span class="pantry-alert-text" id="pantryAlertText"></span>
+      <button type="button" class="pantry-alert-close" id="pantryAlertClose" aria-label="Cerrar aviso">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+
     <!-- ============ TAB: PLATOS ============ -->
     <section class="view active" id="view-dishes">
       <div class="view-header">
@@ -494,6 +503,12 @@
           <button type="button" class="btn-add" id="addPantry" aria-label="Añadir a la despensa">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M5 12h14"/></svg>
           </button>
+        </div>
+        <div class="field ai-field">
+          <span class="field-label">📷 Escanear con IA</span>
+          <input type="file" id="pantryScanImage" accept="image/*" capture="environment" class="ai-image-input" />
+          <button type="button" class="btn-primary" id="pantryScanBtn" style="align-self:flex-start;margin-top:8px;">Escanear recibo o despensa</button>
+          <span class="field-hint">Haz una foto de tu recibo de la compra (o de la nevera/despensa): la IA detecta los productos y estima una fecha de caducidad (orientativa, edítala si hace falta).</span>
         </div>
         <ul class="ingredient-list" id="pantryList"></ul>
         <button type="button" class="btn-secondary" id="pantrySuggestBtn" style="align-self:flex-start;">✨ Sugerir plato con lo que tengo</button>
